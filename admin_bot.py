@@ -16,7 +16,7 @@ import threading
 import requests
 from dotenv import load_dotenv
 
-load_dotenv('.env.admin')
+load_dotenv()
 
 # ─────────────────────────────────────────────
 #  CONFIG
