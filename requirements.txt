@@ -1,0 +1,23 @@
+# NOTE: Upgrade pip first with: python -m pip install --upgrade pip
+# Or simply run: SETUP.bat (it does this automatically)
+
+# Telegram Bot Framework
+python-telegram-bot==20.7
+
+# Web Framework for Webhook
+Flask==3.0.0
+
+# HTTP Requests Library
+requests==2.31.0
+
+# Ngrok for tunneling
+pyngrok==7.0.5
+
+# Scheduler for daily tasks
+APScheduler==3.10.4
+
+# Environment variables
+python-dotenv==1.0.0
+
+# Additional dependencies
+Werkzeug==3.0.1
