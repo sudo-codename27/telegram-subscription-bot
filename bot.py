@@ -68,8 +68,8 @@ TIER_DURATION_DAYS = {
 }
 
 TIER_LABELS = {
-    "bronze": "🥉 Bronze — 100 ⭐ / 2 months",
-    "gold":   "🥇 Gold   — 250 ⭐ / 2 months",
+    "bronze": "🥉 Bronze",
+    "gold":   "🥇 Gold",
 }
 
 CHANNEL_TO_TIER = {v: k for k, v in TIER_CHANNELS.items()}
@@ -570,11 +570,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "✨ *Welcome to Desire Musing!*\n\n"
-        "Get exclusive access to premium content by choosing a plan below.\n"
-        "Payment is made with Telegram Stars ⭐ or Razorpay 💳\n\n"
-        "🥉 *Bronze* — 100 ⭐ or ₹249 / 2 months\n"
-        "🥇 *Gold* — 250 ⭐ or ₹509 / 2 months\n\n"
-        "👇 Select your plan to get started:",
+        "Get access to premium content by choosing a plan below.\n\n"
+        "*_Payment is made with Telegram Stars ⭐ or Razorpay_* 💳\n\n"
+        "🥉 *Bronze Tier* - ⭐ 100 or ₹249 (for 2 months)\n"
+        "🥇 *Gold Tier* - ⭐ 250 or ₹509 (for 2 months)\n\n"
+        "👇 *SELECT YOUR DESIRED PLAN:*",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
@@ -606,8 +606,8 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Settings → My Stars*\n\n"
         "Your balance is shown at the top of that screen.\n\n"
         "💡 *Our prices:*\n"
-        "🥉 Bronze — 100 ⭐ or ₹249 (2 months)\n"
-        "🥇 Gold   — 250 ⭐ or ₹509 (2 months)\n\n"
+        "🥉 *Bronze Tier* - ⭐ 100 or ₹249 (for 2 months)\n"
+        "🥇 *Gold Tier* - ⭐ 250 or ₹509 (for 2 months)\n\n"
         "Use /start when you're ready!",
         parse_mode="Markdown",
     )
@@ -658,8 +658,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text(
             "✨ *Welcome to Desire Musing!*\n\n"
             "Get exclusive access to premium content by choosing a plan below.\n\n"
-            "🥉 *Bronze* — 100 ⭐ or ₹249 / 2 months\n"
-            "🥇 *Gold* — 250 ⭐ or ₹509 / 2 months\n\n"
+            "🥉 *Bronze Tier* - ⭐ 100 or ₹249 (for 2 months)\n"
+            "🥇 *Gold Tier* - ⭐ 250 or ₹509 (for 2 months)\n\n"
             "👇 Select your plan to get started:",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -1126,9 +1126,9 @@ def main():
     async def post_init(application):
         global WEBHOOK_PORT
         await application.bot.set_my_commands([
-            BotCommand("start", "🏠 Main menu & subscription plans"),
-            BotCommand("membership", "📋 Check your active subscriptions"),
-            BotCommand("balance", "💰 How to check your Stars balance"),
+            BotCommand("start", "🚀subscription plans"),
+            BotCommand("membership", "✅Check your active subscriptions"),
+            BotCommand("balance", "⭐How to check your Stars balance"),
         ])
         
         scheduler = AsyncIOScheduler()
