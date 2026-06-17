@@ -91,6 +91,31 @@ def _get_pool():
     return _db_pool
 
 
+def _reset_pool():
+    """Discard the current pool so the next getconn opens a fresh connection.
+
+    Mirrors the recovery logic in bot.py: when Neon recycles an idle socket,
+    every later checkout against the dead pool fails until we rebuild.
+    """
+    global _db_pool
+    with _db_pool_lock:
+        old = _db_pool
+        _db_pool = None
+    if old is not None:
+        try:
+            old.closeall()
+        except Exception:
+            pass
+    logger.warning("Admin DB pool reset; next call will open a fresh Neon connection")
+
+
+# Errors that mean "this socket is dead, throw the whole pool away".
+_FATAL_DB_ERRORS = (
+    psycopg2.OperationalError,
+    psycopg2.InterfaceError,
+)
+
+
 class _PooledConnection:
     def __enter__(self):
         pool = _get_pool()
@@ -103,6 +128,8 @@ class _PooledConnection:
         return self.conn
 
     def __exit__(self, exc_type, exc, tb):
+        broken = exc_type is not None and issubclass(exc_type, _FATAL_DB_ERRORS)
+
         if exc_type is None:
             try:
                 self.conn.commit()
@@ -112,15 +139,25 @@ class _PooledConnection:
                     self.conn.rollback()
                 except Exception:
                     pass
+                broken = isinstance(e, _FATAL_DB_ERRORS)
         else:
             try:
                 self.conn.rollback()
             except Exception:
+                broken = True
+
+        if broken:
+            try:
+                self._pool.putconn(self.conn, close=True)
+            except Exception:
                 pass
-        try:
-            self._pool.putconn(self.conn)
-        except Exception as e:
-            logger.warning(f"Returning conn to pool failed: {e}")
+            _reset_pool()
+        else:
+            try:
+                self._pool.putconn(self.conn)
+            except Exception as e:
+                logger.warning(f"Returning conn to pool failed: {e}")
+                _reset_pool()
         return False
 
 
@@ -738,22 +775,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             },
             timeout=10
         )
-        
+
         if response.status_code == 200:
             mark_approved(payment_id)
             del context.user_data['approving_payment']
 
+            # Honest reporting: bot.py now returns invite_sent so we can
+            # tell the admin if the subscription saved but the DM failed
+            # (e.g. user blocked the bot, bot not channel admin, etc).
+            payload = {}
+            try:
+                payload = response.json() or {}
+            except Exception:
+                payload = {}
+            invite_sent = bool(payload.get("invite_sent"))
+            invite_error = payload.get("error")
+
             tier_emoji = TIER_EMOJI.get(tier, "💳")
-            await update.message.reply_text(
-                f"✅ *Access Granted Successfully!*\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"{tier_emoji} *Tier:*     {tier.title()}\n"
-                f"👤 *User:*     `{user_id}`\n"
-                f"🔖 *Payment:* `{payment_id}`\n"
-                f"📅 *Duration:* {TIER_DURATION_DAYS[tier]} days\n\n"
-                f"✨ User has received their invite link.",
-                parse_mode="Markdown"
-            )
+            if invite_sent:
+                await update.message.reply_text(
+                    f"✅ *Access Granted Successfully!*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"{tier_emoji} *Tier:*     {tier.title()}\n"
+                    f"👤 *User:*     `{user_id}`\n"
+                    f"🔖 *Payment:* `{payment_id}`\n"
+                    f"📅 *Duration:* {TIER_DURATION_DAYS[tier]} days\n\n"
+                    f"✨ User has received their invite link.",
+                    parse_mode="Markdown"
+                )
+            else:
+                err_line = f"\n💥 Reason: `{invite_error}`" if invite_error else ""
+                await update.message.reply_text(
+                    f"⚠️ *Subscription saved — invite link NOT sent*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"{tier_emoji} *Tier:*     {tier.title()}\n"
+                    f"👤 *User:*     `{user_id}`\n"
+                    f"🔖 *Payment:* `{payment_id}`\n"
+                    f"📅 *Duration:* {TIER_DURATION_DAYS[tier]} days"
+                    f"{err_line}\n\n"
+                    f"🛠️ *Recover:* run `/resend_invite {user_id} {tier}` "
+                    f"in the main bot to retry the invite.",
+                    parse_mode="Markdown",
+                )
         else:
             await update.message.reply_text(
                 f"❌ Failed to grant subscription: {response.text}"

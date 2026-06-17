@@ -17,6 +17,7 @@ from telegram.ext import (
     filters,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from dotenv import load_dotenv
 
 # NEW IMPORTS FOR RAZORPAY
@@ -100,6 +101,13 @@ RAZORPAY_PAYMENT_PAGES = {
 USER_COOLDOWNS = {}
 COOLDOWN_SECONDS = 3
 
+# Pre-expiry reminder schedule: send a DM N days before subscription expires.
+# Two reminders only (per user preference: 7 + 1, no spam).
+REMINDER_DAYS_BEFORE = (7, 1)
+
+# Schedule: midnight IST sweep + 9 AM IST reminders.
+SCHEDULE_TIMEZONE = "Asia/Kolkata"
+
 # ─────────────────────────────────────────────
 #  LOGGING
 # ─────────────────────────────────────────────
@@ -138,6 +146,31 @@ def _get_pool():
     return _db_pool
 
 
+def _reset_pool():
+    """Discard the current pool so the next getconn opens a fresh connection.
+
+    Neon recycles idle connections aggressively; once one in our pool turns
+    stale, every subsequent checkout against it fails until we rebuild.
+    """
+    global _db_pool
+    with _db_pool_lock:
+        old = _db_pool
+        _db_pool = None
+    if old is not None:
+        try:
+            old.closeall()
+        except Exception:
+            pass
+    logger.warning("DB pool reset; next call will open a fresh Neon connection")
+
+
+# Errors that mean "this socket is dead, throw the whole pool away".
+_FATAL_DB_ERRORS = (
+    psycopg2.OperationalError,
+    psycopg2.InterfaceError,
+)
+
+
 class _PooledConnection:
     """Context manager that hands a connection back to the pool on exit.
 
@@ -158,6 +191,8 @@ class _PooledConnection:
         return self.conn
 
     def __exit__(self, exc_type, exc, tb):
+        broken = exc_type is not None and issubclass(exc_type, _FATAL_DB_ERRORS)
+
         if exc_type is None:
             try:
                 self.conn.commit()
@@ -167,15 +202,28 @@ class _PooledConnection:
                     self.conn.rollback()
                 except Exception:
                     pass
+                broken = isinstance(e, _FATAL_DB_ERRORS)
         else:
             try:
                 self.conn.rollback()
             except Exception:
+                # If we can't even rollback, the connection is dead.
+                broken = True
+
+        if broken:
+            # Don't return this corpse to the pool; throw the pool out so
+            # the next caller gets a fresh socket from Neon.
+            try:
+                self._pool.putconn(self.conn, close=True)
+            except Exception:
                 pass
-        try:
-            self._pool.putconn(self.conn)
-        except Exception as e:
-            logger.warning(f"Returning conn to pool failed: {e}")
+            _reset_pool()
+        else:
+            try:
+                self._pool.putconn(self.conn)
+            except Exception as e:
+                logger.warning(f"Returning conn to pool failed: {e}")
+                _reset_pool()
         return False  # propagate exceptions
 
 
@@ -188,6 +236,16 @@ def db_connect():
                 cur.execute("SELECT 1")
     """
     return _PooledConnection()
+
+
+def _with_db_retry(fn, *args, **kwargs):
+    """Run a DB callable, retry once on a stale-connection error."""
+    try:
+        return fn(*args, **kwargs)
+    except _FATAL_DB_ERRORS as e:
+        logger.warning(f"DB connection lost during {fn.__name__}: {e}; retrying once")
+        _reset_pool()
+        return fn(*args, **kwargs)
 
 # ─────────────────────────────────────────────
 #  FLASK WEBHOOK SERVER
@@ -202,6 +260,11 @@ def grant_subscription_sync(user_id: int, tier: str, payment_id: str, paid_amoun
 
     Shared by the Razorpay webhook and the /api/grant_subscription endpoint so
     both paths behave identically. Returns a (body_dict, http_status) tuple.
+
+    Body shape so the admin bot can show honest status:
+        {"status": "success", "invite_sent": true}                # full happy path
+        {"status": "success", "invite_sent": false, "error": "…"} # subscription saved, link failed
+        {"status": "already_processed"}                            # duplicate webhook
     """
     if charge_id_already_used(payment_id):
         logger.warning(f"Duplicate payment {payment_id}")
@@ -221,12 +284,25 @@ def grant_subscription_sync(user_id: int, tier: str, payment_id: str, paid_amoun
 
     logger.info(f"✅ Subscription granted: user {user_id}, tier {tier}, payment {payment_id} ({status})")
 
+    invite_sent = False
+    invite_error = None
     if bot_app:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(send_invite_link(user_id, tier, expiry, payment_id))
+        try:
+            invite_sent, invite_error = loop.run_until_complete(
+                send_invite_link(user_id, tier, expiry, payment_id)
+            )
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
 
-    return {"status": "success"}, 200
+    body = {"status": "success", "invite_sent": bool(invite_sent)}
+    if not invite_sent and invite_error:
+        body["error"] = invite_error
+    return body, 200
 
 
 def verify_razorpay_signature(payload, signature, secret):
@@ -399,6 +475,12 @@ def init_db():
                     banned_by   BIGINT
                 )
             """)
+            # last_reminder_day prevents duplicate DMs in the same window
+            # if the scheduler fires twice. Cheap text column, nullable.
+            cur.execute("""
+                ALTER TABLE subscriptions
+                ADD COLUMN IF NOT EXISTS last_reminder_day INTEGER
+            """)
     logger.info("✅ Database tables ready (PostgreSQL/Neon)")
 
 def get_active_subscription(user_id: int, tier: str):
@@ -435,12 +517,13 @@ def save_subscription(user_id: int, tier: str, expiry: datetime, charge_id: str)
             with con.cursor() as cur:
                 cur.execute(
                     """INSERT INTO subscriptions
-                       (user_id, tier, expiry, charge_id, started_at)
-                       VALUES (%s, %s, %s, %s, %s)
+                       (user_id, tier, expiry, charge_id, started_at, last_reminder_day)
+                       VALUES (%s, %s, %s, %s, %s, NULL)
                        ON CONFLICT (user_id, tier) DO UPDATE SET
-                         expiry     = EXCLUDED.expiry,
-                         charge_id  = EXCLUDED.charge_id,
-                         started_at = EXCLUDED.started_at""",
+                         expiry            = EXCLUDED.expiry,
+                         charge_id         = EXCLUDED.charge_id,
+                         started_at        = EXCLUDED.started_at,
+                         last_reminder_day = NULL""",
                     (user_id, tier, expiry.isoformat(), charge_id, datetime.now().isoformat()),
                 )
     except Exception as e:
@@ -470,8 +553,44 @@ def get_expired_subscriptions():
         logger.error(f"Database error in get_expired_subscriptions: {e}")
         return []
 
-def charge_id_already_used(charge_id: str) -> bool:
+
+def get_subscriptions_expiring_in(days: int):
+    """Rows whose expiry falls in the [now+days-12h, now+days+12h] window.
+
+    A 24-hour window sized around the target day means we tolerate the cron
+    firing slightly before/after midnight without missing or double-firing.
+    """
     try:
+        target_low = (datetime.now() + timedelta(days=days, hours=-12)).isoformat()
+        target_high = (datetime.now() + timedelta(days=days, hours=12)).isoformat()
+        with db_connect() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    """SELECT user_id, tier, expiry, last_reminder_day
+                       FROM subscriptions
+                       WHERE expiry >= %s AND expiry <= %s""",
+                    (target_low, target_high),
+                )
+                return cur.fetchall()
+    except Exception as e:
+        logger.error(f"Database error in get_subscriptions_expiring_in: {e}")
+        return []
+
+
+def mark_reminder_sent(user_id: int, tier: str, days_before: int):
+    try:
+        with db_connect() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    """UPDATE subscriptions SET last_reminder_day = %s
+                       WHERE user_id = %s AND tier = %s""",
+                    (days_before, user_id, tier),
+                )
+    except Exception as e:
+        logger.error(f"Database error in mark_reminder_sent: {e}")
+
+def charge_id_already_used(charge_id: str) -> bool:
+    def _query():
         with db_connect() as con:
             with con.cursor() as cur:
                 cur.execute(
@@ -479,8 +598,13 @@ def charge_id_already_used(charge_id: str) -> bool:
                     (charge_id,),
                 )
                 return cur.fetchone() is not None
+
+    try:
+        return _with_db_retry(_query)
     except Exception as e:
         logger.error(f"Database error in charge_id_already_used: {e}")
+        # Conservative default: if we can't tell, assume it's a fresh payment.
+        # The unique constraint on payments_log.charge_id is the real backstop.
         return False
 
 def log_payment(user_id: int, tier: str, charge_id: str, stars: int, status: str):
@@ -561,19 +685,29 @@ def format_subscription_card(tier: str, expiry_str: str, started_str: str) -> st
     )
 
 async def send_invite_link(user_id: int, tier: str, expiry: datetime, payment_id: str):
-    """Send channel invite link after successful payment."""
+    """Send channel invite link after successful payment.
+
+    Returns (sent: bool, error_message: Optional[str]) so callers can report
+    honest status in admin notifications.
+    """
     if not bot_app:
-        logger.error("Bot app not initialized")
-        return
-    
+        msg = "Bot app not initialized"
+        logger.error(msg)
+        return False, msg
+
     try:
         link = await bot_app.bot.create_chat_invite_link(
             chat_id=TIER_CHANNELS[tier],
             creates_join_request=True,
             expire_date=datetime.now() + timedelta(minutes=20),
-            member_limit=1,
+            # NOTE: member_limit cannot be combined with creates_join_request=True;
+            # Telegram returns 400 "Member limit can't be specified for links
+            # requiring administrator approval". The join-request handler is the
+            # real gatekeeper — see approve_join_request() — so the link being
+            # reusable for ~20 minutes is fine.
+            name=f"sub:{tier}:{user_id}",
         )
-        
+
         await bot_app.bot.send_message(
             chat_id=user_id,
             text=(
@@ -583,17 +717,20 @@ async def send_invite_link(user_id: int, tier: str, expiry: datetime, payment_id
                 f"📅 Active until: *{expiry.strftime('%d %b %Y')}*\n"
                 f"🔖 Payment ID: `{payment_id}`\n\n"
                 f"👇 Tap the link and press *'Request to Join'*\n"
-                f"*(Single-use link — valid for 20 minutes)*\n\n"
+                f"*(Valid for 20 minutes — only you will be approved)*\n\n"
                 f"{link.invite_link}\n\n"
                 f"Use /membership anytime to check your status."
             ),
             parse_mode="Markdown"
         )
-        
-        logger.info(f"Invite link sent to user {user_id}")
-        
+
+        logger.info(f"Invite link sent to user {user_id} ({tier})")
+        return True, None
+
     except Exception as e:
-        logger.error(f"Failed to send invite link: {e}")
+        err = str(e)
+        logger.error(f"Failed to send invite link to {user_id} ({tier}): {err}")
+        return False, err
 
 def rate_limit(seconds=COOLDOWN_SECONDS):
     def decorator(func):
@@ -848,7 +985,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if days_left > 1:
                 await query.message.reply_text(
-                    f"ℹ️ *You already have an active {tier.title()} subscription!*\n\n"
+                    f"♨️ *You already have an active {tier.title()} subscription!*\n\n"
                     f"Expires: *{exp_dt.strftime('%d %b %Y')}* ({days_left} days left)\n\n"
                     f"You can renew in the last 24 hours of your plan.\n"
                     f"No payment needed right now — you're all set! 🎉",
@@ -946,9 +1083,12 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
             chat_id=TIER_CHANNELS[tier],
             creates_join_request=True,
             expire_date=datetime.now() + timedelta(minutes=20),
-            member_limit=1,
+            # See note in send_invite_link() — member_limit is incompatible
+            # with creates_join_request=True (Telegram 400). approve_join_request
+            # is the real gatekeeper.
+            name=f"sub:{tier}:{user_id}",
         )
-        
+
         await update.message.reply_text(
             f"✅ *Payment Successful! Thank you!*\n\n"
             f"⭐ Stars paid : *{stars_paid}*\n"
@@ -956,7 +1096,7 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
             f"📅 Active until: *{expiry.strftime('%d %b %Y')}*\n"
             f"🔖 Ref        : `{charge_id}`\n\n"
             f"👇 Tap the link and press *'Request to Join'*\n"
-            f"*(Single-use link — valid for 20 minutes)*\n\n"
+            f"*(Valid for 20 minutes — only you will be approved)*\n\n"
             f"{link.invite_link}\n\n"
             f"Use /membership anytime to check your status.",
             parse_mode="Markdown",
@@ -1148,45 +1288,171 @@ async def check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(response, parse_mode="Markdown")
 
     except ValueError:
-        await update.message.reply_text("✋🏻🛑⛔️ Invalid user ID. Must be a number.")
+        await update.message.reply_text("❋🏻🛑⛔️ Invalid user ID. Must be a number.")
     except Exception as e:
         logger.error(f"Error in check command: {e}")
-        await update.message.reply_text(f"⛔ Error: {e}")
+        await update.message.reply_text(f"❔ Error: {e}")
+
+
+async def resend_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin command: re-send a fresh invite link to an existing subscriber.
+
+    Usage: /resend_invite <user_id> <tier>
+
+    Designed to recover orphaned subscriptions whose original invite link
+    failed to send (e.g. the member_limit=1 bug pre-fix). Validates that the
+    user has an active subscription for the requested tier first.
+    """
+    if update.effective_user.id != ADMIN_USER_ID:
+        return
+
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "Usage: `/resend_invite <user_id> <tier>`\n\n"
+            "Example: `/resend_invite 1501159868 bronze`",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        target_user_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID. Must be a number.")
+        return
+
+    tier = context.args[1].lower()
+    if tier not in TIER_CHANNELS:
+        await update.message.reply_text("❌ Invalid tier. Use: bronze or gold")
+        return
+
+    sub = get_active_subscription(target_user_id, tier)
+    if not sub:
+        await update.message.reply_text(
+            f"❌ User `{target_user_id}` has no active *{tier.title()}* subscription.\n\n"
+            f"Use the admin bot's Approve flow to grant one first.",
+            parse_mode="Markdown",
+        )
+        return
+
+    expiry = datetime.fromisoformat(sub[1])
+    payment_id = f"resend_{target_user_id}_{tier}_{int(time())}"
+
+    sent, err = await send_invite_link(target_user_id, tier, expiry, payment_id)
+
+    if sent:
+        await update.message.reply_text(
+            f"✅ *Invite link resent*\n\n"
+            f"👤 User: `{target_user_id}`\n"
+            f"📦 Tier: *{tier.title()}*\n"
+            f"📅 Expires: {expiry.strftime('%d %b %Y')}",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ *Failed to resend invite*\n\n"
+            f"👤 User: `{target_user_id}`\n"
+            f"📦 Tier: *{tier.title()}*\n"
+            f"💥 Reason: `{err}`\n\n"
+            f"Common causes: bot is not a channel admin, user has blocked the bot.",
+            parse_mode="Markdown",
+        )
 
 # ─────────────────────────────────────────────
-#  DAILY EXPIRY CHECK
+#  EXPIRY SWEEP & PRE-EXPIRY REMINDERS
 # ─────────────────────────────────────────────
 
-async def check_expiries(app):
-    logger.info("Running daily expiry check...")
+async def expiry_sweep_job(application):
+    """Daily midnight-IST sweep: kick expired users, DM them, delete row.
+
+    Strict 0-day grace per user preference. Row is deleted (not marked
+    inactive) to keep Neon free-tier footprint tiny.
+    """
+    logger.info("Running daily expiry sweep…")
     expired = get_expired_subscriptions()
 
     if not expired:
-        logger.info("No expired subscriptions.")
+        logger.info("No expired subscriptions today.")
         return
 
     for user_id, tier in expired:
         channel_id = TIER_CHANNELS.get(tier)
         if not channel_id:
+            # Tier renamed/removed — just clean up the orphan row.
+            delete_subscription(user_id, tier)
             continue
         try:
-            await app.bot.ban_chat_member(chat_id=channel_id, user_id=user_id)
-            await app.bot.unban_chat_member(chat_id=channel_id, user_id=user_id)
-            
-            await app.bot.send_message(
-                chat_id=user_id,
-                text=(
-                    f"⏰ *Your {tier.title()} subscription has expired.*\n\n"
-                    f"You have been removed from the {tier.title()} channel.\n\n"
-                    f"Use /start to renew and get access again! 🔄"
-                ),
-                parse_mode="Markdown",
-            )
+            # ban + unban = "kick" without long-term banishment, so they can
+            # rejoin if they pay again later.
+            await application.bot.ban_chat_member(chat_id=channel_id, user_id=user_id)
+            await application.bot.unban_chat_member(chat_id=channel_id, user_id=user_id)
+
+            try:
+                await application.bot.send_message(
+                    chat_id=user_id,
+                    text=(
+                        f"⏰ *Your {tier.title()} subscription has expired.*\n\n"
+                        f"You have been removed from the {tier.title()} channel.\n\n"
+                        f"Use /start to renew and get access again! 🔄"
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception as dm_err:
+                # User may have blocked the bot — kick still succeeded.
+                logger.warning(f"Could not DM expired user {user_id}: {dm_err}")
+
             logger.info(f"Kicked expired user {user_id} from {tier}")
         except Exception as e:
             logger.warning(f"Could not kick user {user_id} from {tier}: {e}")
         finally:
             delete_subscription(user_id, tier)
+
+
+async def reminder_job(application):
+    """Daily 9 AM IST job: send 7-day and 1-day pre-expiry reminders.
+
+    Iterates the (7, 1) schedule. last_reminder_day on the row prevents
+    re-sending the same reminder if the cron fires twice or the bot reboots.
+    """
+    logger.info("Running pre-expiry reminder pass…")
+    sent_total = 0
+
+    for days_before in REMINDER_DAYS_BEFORE:
+        rows = get_subscriptions_expiring_in(days_before)
+
+        for user_id, tier, expiry_str, last_reminder in rows:
+            # Don't re-send reminders we've already sent.
+            if last_reminder is not None and last_reminder <= days_before:
+                continue
+            try:
+                exp_dt = datetime.fromisoformat(expiry_str)
+            except Exception:
+                continue
+
+            try:
+                if days_before == 1:
+                    msg = (
+                        f"⚠️ *{tier.title()} subscription expires tomorrow*\n\n"
+                        f"📅 Expires: *{exp_dt.strftime('%d %b %Y')}*\n\n"
+                        f"Renew now via /start to avoid losing access. 🚀"
+                    )
+                else:
+                    msg = (
+                        f"🔔 *{tier.title()} subscription expires in {days_before} days*\n\n"
+                        f"📅 Expires: *{exp_dt.strftime('%d %b %Y')}*\n\n"
+                        f"Beat the rush — tap /start to renew when you're ready."
+                    )
+                await application.bot.send_message(
+                    chat_id=user_id,
+                    text=msg,
+                    parse_mode="Markdown",
+                )
+                mark_reminder_sent(user_id, tier, days_before)
+                sent_total += 1
+            except Exception as e:
+                # Most common: user blocked the bot.
+                logger.info(f"Reminder skipped for {user_id} ({tier}, T-{days_before}d): {e}")
+
+    logger.info(f"Reminder pass done; {sent_total} DM(s) sent.")
 
 # ─────────────────────────────────────────────
 #  RUN WEBHOOK SERVER
@@ -1214,6 +1480,7 @@ def main():
     bot_app.add_handler(CommandHandler("ban", ban_user))
     bot_app.add_handler(CommandHandler("unban", unban_user))
     bot_app.add_handler(CommandHandler("check", check_user))
+    bot_app.add_handler(CommandHandler("resend_invite", resend_invite))
     bot_app.add_handler(CallbackQueryHandler(button_handler))
     bot_app.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))
     bot_app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
@@ -1226,17 +1493,34 @@ def main():
             BotCommand("membership", "✅*CHECK ACTIVE SUBSCRIPTION*"),
             BotCommand("balance", "*STEPS TO CHECK ⭐-BALANCE*"),
         ])
-        
-        scheduler = AsyncIOScheduler()
+
+        scheduler = AsyncIOScheduler(timezone=SCHEDULE_TIMEZONE)
+
+        # Midnight IST: kick expired subscribers.
         scheduler.add_job(
-            check_expiries,
-            trigger="interval",
-            hours=24,
+            expiry_sweep_job,
+            trigger=CronTrigger(hour=0, minute=0, timezone=SCHEDULE_TIMEZONE),
             args=[application],
-            next_run_time=datetime.now(),
+            id="expiry_sweep",
+            replace_existing=True,
+            misfire_grace_time=3600,
         )
+
+        # 9 AM IST: nudge users 7 days and 1 day before expiry.
+        scheduler.add_job(
+            reminder_job,
+            trigger=CronTrigger(hour=9, minute=0, timezone=SCHEDULE_TIMEZONE),
+            args=[application],
+            id="reminder_job",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+
         scheduler.start()
-        
+        logger.info(
+            "✅ Scheduled jobs registered: expiry_sweep@00:00 IST, reminder_job@09:00 IST"
+        )
+
         logger.info("✅ Bot started successfully!")
         logger.info(f"✅ Webhook server running on port {WEBHOOK_PORT}")
 
