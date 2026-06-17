@@ -1,6 +1,7 @@
 import logging
 import os
-import sqlite3
+import psycopg2
+from psycopg2 import pool as pg_pool
 from datetime import datetime, timedelta
 from functools import wraps
 from time import time
@@ -48,9 +49,15 @@ ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "0"))
 # Shared secret used to authenticate admin_bot.py -> bot.py API calls.
 SECRET_API_KEY = os.environ.get("SECRET_API_KEY", "")
 
-# Database path. Defaults to the local file for development; on Railway set
-# DB_PATH=/data/subscriptions.db so data lives on the attached volume.
-DB_PATH = os.environ.get("DB_PATH", "subscriptions.db")
+# PostgreSQL (Neon) connection string. Required on Railway.
+# Format: postgresql://user:pass@host/dbname?sslmode=require
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+if not DATABASE_URL:
+    raise ValueError(
+        "❌ DATABASE_URL not set!\n"
+        "Set the Neon connection string as an environment variable:\n"
+        "DATABASE_URL=postgresql://user:pass@host/dbname?sslmode=require"
+    )
 
 TIER_CHANNELS = {
     "bronze": -1004446165809,
@@ -104,12 +111,83 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
-#  DATABASE
+#  DATABASE (PostgreSQL / Neon)
 # ─────────────────────────────────────────────
 
+# Lazily-initialised connection pool. Neon is serverless and may close idle
+# connections, so we keep the pool small and rely on getconn/putconn to
+# transparently re-establish broken connections.
+_db_pool = None
+_db_pool_lock = threading.Lock()
+
+
+def _build_pool():
+    return pg_pool.SimpleConnectionPool(
+        minconn=1,
+        maxconn=5,
+        dsn=DATABASE_URL,
+    )
+
+
+def _get_pool():
+    global _db_pool
+    if _db_pool is None:
+        with _db_pool_lock:
+            if _db_pool is None:
+                _db_pool = _build_pool()
+    return _db_pool
+
+
+class _PooledConnection:
+    """Context manager that hands a connection back to the pool on exit.
+
+    Also commits on successful exit and rolls back on exception. If the
+    underlying connection is broken (e.g. Neon recycled it), we discard it
+    and rebuild the pool so the next call picks up a fresh connection.
+    """
+
+    def __enter__(self):
+        pool = _get_pool()
+        self._pool = pool
+        self.conn = pool.getconn()
+        # Make sure stale transactions don't leak between checkouts.
+        try:
+            self.conn.rollback()
+        except Exception:
+            pass
+        return self.conn
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            try:
+                self.conn.commit()
+            except Exception as e:
+                logger.error(f"DB commit failed: {e}")
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
+        else:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+        try:
+            self._pool.putconn(self.conn)
+        except Exception as e:
+            logger.warning(f"Returning conn to pool failed: {e}")
+        return False  # propagate exceptions
+
+
 def db_connect():
-    """Open a connection to the subscriptions database (honors DB_PATH)."""
-    return sqlite3.connect(DB_PATH)
+    """Acquire a pooled PostgreSQL connection (use as context manager).
+
+    Usage:
+        with db_connect() as con:
+            with con.cursor() as cur:
+                cur.execute("SELECT 1")
+    """
+    return _PooledConnection()
 
 # ─────────────────────────────────────────────
 #  FLASK WEBHOOK SERVER
@@ -289,163 +367,173 @@ def index():
 # ─────────────────────────────────────────────
 
 def init_db():
-    con = db_connect()
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS subscriptions (
-            user_id     INTEGER,
-            tier        TEXT,
-            expiry      TEXT,
-            charge_id   TEXT,
-            started_at  TEXT,
-            PRIMARY KEY (user_id, tier)
-        )
-    """)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS payments_log (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id     INTEGER,
-            tier        TEXT,
-            charge_id   TEXT UNIQUE,
-            stars       INTEGER,
-            paid_at     TEXT,
-            status      TEXT
-        )
-    """)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS blacklist (
-            user_id     INTEGER PRIMARY KEY,
-            reason      TEXT,
-            banned_at   TEXT,
-            banned_by   INTEGER
-        )
-    """)
-    con.commit()
-    con.close()
+    """Create tables if they don't exist. Idempotent — safe to call on every boot."""
+    with db_connect() as con:
+        with con.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    user_id     BIGINT,
+                    tier        TEXT,
+                    expiry      TEXT,
+                    charge_id   TEXT,
+                    started_at  TEXT,
+                    PRIMARY KEY (user_id, tier)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS payments_log (
+                    id          SERIAL PRIMARY KEY,
+                    user_id     BIGINT,
+                    tier        TEXT,
+                    charge_id   TEXT UNIQUE,
+                    stars       INTEGER,
+                    paid_at     TEXT,
+                    status      TEXT
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS blacklist (
+                    user_id     BIGINT PRIMARY KEY,
+                    reason      TEXT,
+                    banned_at   TEXT,
+                    banned_by   BIGINT
+                )
+            """)
+    logger.info("✅ Database tables ready (PostgreSQL/Neon)")
 
 def get_active_subscription(user_id: int, tier: str):
     try:
-        con = db_connect()
-        row = con.execute(
-            """SELECT tier, expiry, started_at FROM subscriptions
-               WHERE user_id = ? AND tier = ? AND expiry > ?""",
-            (user_id, tier, datetime.now().isoformat()),
-        ).fetchone()
-        con.close()
-        return row
+        with db_connect() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    """SELECT tier, expiry, started_at FROM subscriptions
+                       WHERE user_id = %s AND tier = %s AND expiry > %s""",
+                    (user_id, tier, datetime.now().isoformat()),
+                )
+                return cur.fetchone()
     except Exception as e:
         logger.error(f"Database error in get_active_subscription: {e}")
         return None
 
 def get_all_active_subscriptions(user_id: int):
     try:
-        con = db_connect()
-        rows = con.execute(
-            """SELECT tier, expiry, started_at FROM subscriptions
-               WHERE user_id = ? AND expiry > ?""",
-            (user_id, datetime.now().isoformat()),
-        ).fetchall()
-        con.close()
-        return rows
+        with db_connect() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    """SELECT tier, expiry, started_at FROM subscriptions
+                       WHERE user_id = %s AND expiry > %s""",
+                    (user_id, datetime.now().isoformat()),
+                )
+                return cur.fetchall()
     except Exception as e:
         logger.error(f"Database error in get_all_active_subscriptions: {e}")
         return []
 
 def save_subscription(user_id: int, tier: str, expiry: datetime, charge_id: str):
     try:
-        con = db_connect()
-        con.execute(
-            """INSERT OR REPLACE INTO subscriptions
-               (user_id, tier, expiry, charge_id, started_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (user_id, tier, expiry.isoformat(), charge_id, datetime.now().isoformat()),
-        )
-        con.commit()
-        con.close()
+        with db_connect() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO subscriptions
+                       (user_id, tier, expiry, charge_id, started_at)
+                       VALUES (%s, %s, %s, %s, %s)
+                       ON CONFLICT (user_id, tier) DO UPDATE SET
+                         expiry     = EXCLUDED.expiry,
+                         charge_id  = EXCLUDED.charge_id,
+                         started_at = EXCLUDED.started_at""",
+                    (user_id, tier, expiry.isoformat(), charge_id, datetime.now().isoformat()),
+                )
     except Exception as e:
         logger.error(f"Database error in save_subscription: {e}")
 
 def delete_subscription(user_id: int, tier: str):
     try:
-        con = db_connect()
-        con.execute(
-            "DELETE FROM subscriptions WHERE user_id = ? AND tier = ?",
-            (user_id, tier),
-        )
-        con.commit()
-        con.close()
+        with db_connect() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM subscriptions WHERE user_id = %s AND tier = %s",
+                    (user_id, tier),
+                )
     except Exception as e:
         logger.error(f"Database error in delete_subscription: {e}")
 
 def get_expired_subscriptions():
     try:
-        con = db_connect()
-        rows = con.execute(
-            "SELECT user_id, tier FROM subscriptions WHERE expiry <= ?",
-            (datetime.now().isoformat(),),
-        ).fetchall()
-        con.close()
-        return rows
+        with db_connect() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    "SELECT user_id, tier FROM subscriptions WHERE expiry <= %s",
+                    (datetime.now().isoformat(),),
+                )
+                return cur.fetchall()
     except Exception as e:
         logger.error(f"Database error in get_expired_subscriptions: {e}")
         return []
 
 def charge_id_already_used(charge_id: str) -> bool:
     try:
-        con = db_connect()
-        row = con.execute(
-            "SELECT id FROM payments_log WHERE charge_id = ?", (charge_id,)
-        ).fetchone()
-        con.close()
-        return row is not None
+        with db_connect() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM payments_log WHERE charge_id = %s",
+                    (charge_id,),
+                )
+                return cur.fetchone() is not None
     except Exception as e:
         logger.error(f"Database error in charge_id_already_used: {e}")
         return False
 
 def log_payment(user_id: int, tier: str, charge_id: str, stars: int, status: str):
     try:
-        con = db_connect()
-        con.execute(
-            """INSERT OR IGNORE INTO payments_log
-               (user_id, tier, charge_id, stars, paid_at, status)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (user_id, tier, charge_id, stars, datetime.now().isoformat(), status),
-        )
-        con.commit()
-        con.close()
+        with db_connect() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO payments_log
+                       (user_id, tier, charge_id, stars, paid_at, status)
+                       VALUES (%s, %s, %s, %s, %s, %s)
+                       ON CONFLICT (charge_id) DO NOTHING""",
+                    (user_id, tier, charge_id, stars, datetime.now().isoformat(), status),
+                )
     except Exception as e:
         logger.warning(f"Could not log payment: {e}")
 
 def is_blacklisted(user_id: int) -> bool:
     try:
-        con = db_connect()
-        row = con.execute(
-            "SELECT user_id FROM blacklist WHERE user_id = ?", (user_id,)
-        ).fetchone()
-        con.close()
-        return row is not None
+        with db_connect() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    "SELECT user_id FROM blacklist WHERE user_id = %s",
+                    (user_id,),
+                )
+                return cur.fetchone() is not None
     except Exception as e:
         logger.error(f"Database error in is_blacklisted: {e}")
         return False
 
 def add_to_blacklist(user_id: int, reason: str, banned_by: int):
     try:
-        con = db_connect()
-        con.execute(
-            """INSERT OR REPLACE INTO blacklist (user_id, reason, banned_at, banned_by)
-               VALUES (?, ?, ?, ?)""",
-            (user_id, reason, datetime.now().isoformat(), banned_by)
-        )
-        con.commit()
-        con.close()
+        with db_connect() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO blacklist (user_id, reason, banned_at, banned_by)
+                       VALUES (%s, %s, %s, %s)
+                       ON CONFLICT (user_id) DO UPDATE SET
+                         reason    = EXCLUDED.reason,
+                         banned_at = EXCLUDED.banned_at,
+                         banned_by = EXCLUDED.banned_by""",
+                    (user_id, reason, datetime.now().isoformat(), banned_by),
+                )
     except Exception as e:
         logger.error(f"Database error in add_to_blacklist: {e}")
 
 def remove_from_blacklist(user_id: int):
     try:
-        con = db_connect()
-        con.execute("DELETE FROM blacklist WHERE user_id = ?", (user_id,))
-        con.commit()
-        con.close()
+        with db_connect() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM blacklist WHERE user_id = %s",
+                    (user_id,),
+                )
     except Exception as e:
         logger.error(f"Database error in remove_from_blacklist: {e}")
 

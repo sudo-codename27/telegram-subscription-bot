@@ -1,6 +1,7 @@
 import logging
 import os
-import sqlite3
+import psycopg2
+from psycopg2 import pool as pg_pool
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -17,6 +18,7 @@ import requests
 from dotenv import load_dotenv
 
 load_dotenv('.env.admin')
+load_dotenv()  # also pick up generic .env if present
 
 # ─────────────────────────────────────────────
 #  CONFIG
@@ -30,6 +32,16 @@ RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "")
 # Railway injects $PORT for the public web server. Prefer it, then fall back
 # to ADMIN_PORT (explicit override) and finally 8081 for local development.
 WEBHOOK_PORT = int(os.environ.get("PORT") or os.environ.get("ADMIN_PORT", "8081"))
+
+# Same Neon Postgres database as the main bot. We use a separate table
+# (pending_payments) so the two services don't step on each other.
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+if not DATABASE_URL:
+    raise ValueError(
+        "❌ DATABASE_URL not set!\n"
+        "Set the Neon connection string as an environment variable:\n"
+        "DATABASE_URL=postgresql://user:pass@host/dbname?sslmode=require"
+    )
 
 # Tier names accepted when an admin approves a payment. Values are only used
 # for validation here; actual charge amounts live in bot.py (RAZORPAY_PRICES).
@@ -50,68 +62,144 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
-#  DATABASE
+#  DATABASE (PostgreSQL / Neon)
 # ─────────────────────────────────────────────
 
-# NOTE: this is a transient queue of pending approvals and is intentionally
-# NOT persisted to a volume. It repopulates from incoming Razorpay webhooks.
+_db_pool = None
+_db_pool_lock = threading.Lock()
+
+
+def _build_pool():
+    return pg_pool.SimpleConnectionPool(
+        minconn=1,
+        maxconn=3,
+        dsn=DATABASE_URL,
+    )
+
+
+def _get_pool():
+    global _db_pool
+    if _db_pool is None:
+        with _db_pool_lock:
+            if _db_pool is None:
+                _db_pool = _build_pool()
+    return _db_pool
+
+
+class _PooledConnection:
+    def __enter__(self):
+        pool = _get_pool()
+        self._pool = pool
+        self.conn = pool.getconn()
+        try:
+            self.conn.rollback()
+        except Exception:
+            pass
+        return self.conn
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            try:
+                self.conn.commit()
+            except Exception as e:
+                logger.error(f"DB commit failed: {e}")
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
+        else:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+        try:
+            self._pool.putconn(self.conn)
+        except Exception as e:
+            logger.warning(f"Returning conn to pool failed: {e}")
+        return False
+
+
+def _db():
+    return _PooledConnection()
+
 
 def init_db():
-    con = sqlite3.connect("admin_payments.db")
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS pending_payments (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            payment_id  TEXT UNIQUE,
-            amount      INTEGER,
-            email       TEXT,
-            contact     TEXT,
-            user_id     INTEGER,
-            tier        TEXT,
-            received_at TEXT,
-            status      TEXT DEFAULT 'pending'
-        )
-    """)
-    con.commit()
-    con.close()
+    """Create the pending_payments table on first boot. Idempotent."""
+    with _db() as con:
+        with con.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pending_payments (
+                    id          SERIAL PRIMARY KEY,
+                    payment_id  TEXT UNIQUE,
+                    amount      INTEGER,
+                    email       TEXT,
+                    contact     TEXT,
+                    user_id     BIGINT,
+                    tier        TEXT,
+                    received_at TEXT,
+                    status      TEXT DEFAULT 'pending'
+                )
+            """)
+    logger.info("✅ Admin bot database tables ready (PostgreSQL/Neon)")
+
+
+def _coerce_user_id(user_id):
+    """Notes from Razorpay arrive as strings; coerce to int or None."""
+    if user_id is None or user_id == "":
+        return None
+    try:
+        return int(user_id)
+    except (TypeError, ValueError):
+        return None
+
 
 def save_payment(payment_id, amount, email, contact, user_id, tier):
     try:
-        con = sqlite3.connect("admin_payments.db")
-        con.execute(
-            """INSERT OR IGNORE INTO pending_payments
-               (payment_id, amount, email, contact, user_id, tier, received_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (payment_id, amount, email, contact, user_id, tier, datetime.now().isoformat())
-        )
-        con.commit()
-        con.close()
+        with _db() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO pending_payments
+                       (payment_id, amount, email, contact, user_id, tier, received_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)
+                       ON CONFLICT (payment_id) DO NOTHING""",
+                    (
+                        payment_id,
+                        amount,
+                        email,
+                        contact,
+                        _coerce_user_id(user_id),
+                        tier,
+                        datetime.now().isoformat(),
+                    ),
+                )
     except Exception as e:
-        logger.error(f"Database error: {e}")
+        logger.error(f"Database error in save_payment: {e}")
+
 
 def mark_approved(payment_id):
     try:
-        con = sqlite3.connect("admin_payments.db")
-        con.execute(
-            "UPDATE pending_payments SET status = 'approved' WHERE payment_id = ?",
-            (payment_id,)
-        )
-        con.commit()
-        con.close()
+        with _db() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    "UPDATE pending_payments SET status = 'approved' WHERE payment_id = %s",
+                    (payment_id,),
+                )
     except Exception as e:
-        logger.error(f"Database error: {e}")
+        logger.error(f"Database error in mark_approved: {e}")
+
 
 def get_pending_payments():
     try:
-        con = sqlite3.connect("admin_payments.db")
-        rows = con.execute(
-            """SELECT payment_id, amount, email, contact, user_id, tier, received_at
-               FROM pending_payments WHERE status = 'pending'
-               ORDER BY received_at DESC LIMIT 20"""
-        ).fetchall()
-        con.close()
-        return rows
+        with _db() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    """SELECT payment_id, amount, email, contact, user_id, tier, received_at
+                       FROM pending_payments WHERE status = 'pending'
+                       ORDER BY received_at DESC LIMIT 20"""
+                )
+                return cur.fetchall()
     except Exception as e:
-        logger.error(f"Database error: {e}")
+        logger.error(f"Database error in get_pending_payments: {e}")
         return []
 
 # ─────────────────────────────────────────────

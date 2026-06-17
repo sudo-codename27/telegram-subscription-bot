@@ -10,14 +10,14 @@ Flask==3.0.0
 # HTTP Requests Library
 requests==2.31.0
 
-# Ngrok for tunneling
-pyngrok==7.0.5
-
 # Scheduler for daily tasks
 APScheduler==3.10.4
 
 # Environment variables
 python-dotenv==1.0.0
+
+# PostgreSQL driver (Neon serverless Postgres)
+psycopg2-binary==2.9.9
 
 # Additional dependencies
 Werkzeug==3.0.1
