@@ -420,6 +420,84 @@ def api_grant_subscription():
         logger.error(f"/api/grant_subscription error: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
+
+@webhook_app.route('/api/resend_invite', methods=['POST'])
+def api_resend_invite():
+    """Re-send a fresh channel invite link to an existing subscriber.
+
+    Called by admin_bot.py when an admin runs /resend_invite on the admin bot.
+    Validates that the user has an active subscription for the requested tier
+    (so we don't accidentally invite a non-paying user) and then reuses
+    send_invite_link() so the message format matches the post-payment one.
+
+    Authenticated via SECRET_API_KEY (same shared secret as /api/grant_subscription).
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+
+        provided_key = data.get("api_key", "")
+        if not SECRET_API_KEY or not hmac.compare_digest(str(provided_key), SECRET_API_KEY):
+            logger.warning("Unauthorized /api/resend_invite request (bad or missing api_key)")
+            return jsonify({"error": "Unauthorized"}), 401
+
+        user_id = data.get("user_id")
+        tier = data.get("tier")
+
+        if user_id is None or tier is None:
+            return jsonify({"error": "Missing user_id or tier"}), 400
+
+        try:
+            user_id = int(user_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "Invalid user_id"}), 400
+
+        tier = str(tier).lower()
+        if tier not in TIER_CHANNELS:
+            return jsonify({"error": f"Invalid tier: {tier}"}), 400
+
+        sub = get_active_subscription(user_id, tier)
+        if not sub:
+            return jsonify({
+                "status": "no_active_subscription",
+                "error": f"User {user_id} has no active {tier} subscription",
+            }), 404
+
+        try:
+            expiry = datetime.fromisoformat(sub[1])
+        except Exception:
+            return jsonify({"error": "Stored expiry is not a valid ISO timestamp"}), 500
+
+        payment_id = f"resend_{user_id}_{tier}_{int(time())}"
+
+        if not bot_app:
+            return jsonify({"error": "Bot app not initialized"}), 503
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            invite_sent, invite_error = loop.run_until_complete(
+                send_invite_link(user_id, tier, expiry, payment_id)
+            )
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+
+        body = {
+            "status": "success" if invite_sent else "failed",
+            "invite_sent": bool(invite_sent),
+            "expiry": expiry.isoformat(),
+        }
+        if not invite_sent and invite_error:
+            body["error"] = invite_error
+        return jsonify(body), (200 if invite_sent else 502)
+
+    except Exception as e:
+        logger.error(f"/api/resend_invite error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
 @webhook_app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint."""
@@ -434,6 +512,7 @@ def index():
         "endpoints": {
             "webhook": "/webhook/razorpay",
             "grant_subscription": "/api/grant_subscription",
+            "resend_invite": "/api/resend_invite",
             "health": "/health"
         }
     }), 200
@@ -801,7 +880,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⭐ 100 or ₹249 *(for 2 months)*\n\n"
         "🥇 *Gold Tier*\n"
         "⭐ 250 or ₹509 *(for 2 months)*\n\n"
-        "👇 *SELECT YOUR DESIRE* 🤤🫦",
+        "👇 *SELECT YOUR DESIRE* 🤤🮦",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
@@ -892,7 +971,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⭐ 100 or ₹249 *(for 2 months)*\n\n"
             "🥇 *Gold Tier*\n"
             "⭐ 250 or ₹509 *(for 2 months)*\n\n"
-            "👇 *SELECT YOUR DESIRE* 🤤🫦",
+            "👇 *SELECT YOUR DESIRE* 🤤🮦",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
@@ -985,7 +1064,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if days_left > 1:
                 await query.message.reply_text(
-                    f"♨️ *You already have an active {tier.title()} subscription!*\n\n"
+                    f"♉️ *You already have an active {tier.title()} subscription!*\n\n"
                     f"Expires: *{exp_dt.strftime('%d %b %Y')}* ({days_left} days left)\n\n"
                     f"You can renew in the last 24 hours of your plan.\n"
                     f"No payment needed right now — you're all set! 🎉",
@@ -1288,74 +1367,10 @@ async def check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(response, parse_mode="Markdown")
 
     except ValueError:
-        await update.message.reply_text("❋🏻🛑⛔️ Invalid user ID. Must be a number.")
+        await update.message.reply_text("❋🎻🚿⛔️ Invalid user ID. Must be a number.")
     except Exception as e:
         logger.error(f"Error in check command: {e}")
         await update.message.reply_text(f"❔ Error: {e}")
-
-
-async def resend_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin command: re-send a fresh invite link to an existing subscriber.
-
-    Usage: /resend_invite <user_id> <tier>
-
-    Designed to recover orphaned subscriptions whose original invite link
-    failed to send (e.g. the member_limit=1 bug pre-fix). Validates that the
-    user has an active subscription for the requested tier first.
-    """
-    if update.effective_user.id != ADMIN_USER_ID:
-        return
-
-    if len(context.args) != 2:
-        await update.message.reply_text(
-            "Usage: `/resend_invite <user_id> <tier>`\n\n"
-            "Example: `/resend_invite 1501159868 bronze`",
-            parse_mode="Markdown",
-        )
-        return
-
-    try:
-        target_user_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("❌ Invalid user ID. Must be a number.")
-        return
-
-    tier = context.args[1].lower()
-    if tier not in TIER_CHANNELS:
-        await update.message.reply_text("❌ Invalid tier. Use: bronze or gold")
-        return
-
-    sub = get_active_subscription(target_user_id, tier)
-    if not sub:
-        await update.message.reply_text(
-            f"❌ User `{target_user_id}` has no active *{tier.title()}* subscription.\n\n"
-            f"Use the admin bot's Approve flow to grant one first.",
-            parse_mode="Markdown",
-        )
-        return
-
-    expiry = datetime.fromisoformat(sub[1])
-    payment_id = f"resend_{target_user_id}_{tier}_{int(time())}"
-
-    sent, err = await send_invite_link(target_user_id, tier, expiry, payment_id)
-
-    if sent:
-        await update.message.reply_text(
-            f"✅ *Invite link resent*\n\n"
-            f"👤 User: `{target_user_id}`\n"
-            f"📦 Tier: *{tier.title()}*\n"
-            f"📅 Expires: {expiry.strftime('%d %b %Y')}",
-            parse_mode="Markdown",
-        )
-    else:
-        await update.message.reply_text(
-            f"❌ *Failed to resend invite*\n\n"
-            f"👤 User: `{target_user_id}`\n"
-            f"📦 Tier: *{tier.title()}*\n"
-            f"💥 Reason: `{err}`\n\n"
-            f"Common causes: bot is not a channel admin, user has blocked the bot.",
-            parse_mode="Markdown",
-        )
 
 # ─────────────────────────────────────────────
 #  EXPIRY SWEEP & PRE-EXPIRY REMINDERS
@@ -1480,7 +1495,6 @@ def main():
     bot_app.add_handler(CommandHandler("ban", ban_user))
     bot_app.add_handler(CommandHandler("unban", unban_user))
     bot_app.add_handler(CommandHandler("check", check_user))
-    bot_app.add_handler(CommandHandler("resend_invite", resend_invite))
     bot_app.add_handler(CallbackQueryHandler(button_handler))
     bot_app.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))
     bot_app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))

@@ -91,31 +91,6 @@ def _get_pool():
     return _db_pool
 
 
-def _reset_pool():
-    """Discard the current pool so the next getconn opens a fresh connection.
-
-    Mirrors the recovery logic in bot.py: when Neon recycles an idle socket,
-    every later checkout against the dead pool fails until we rebuild.
-    """
-    global _db_pool
-    with _db_pool_lock:
-        old = _db_pool
-        _db_pool = None
-    if old is not None:
-        try:
-            old.closeall()
-        except Exception:
-            pass
-    logger.warning("Admin DB pool reset; next call will open a fresh Neon connection")
-
-
-# Errors that mean "this socket is dead, throw the whole pool away".
-_FATAL_DB_ERRORS = (
-    psycopg2.OperationalError,
-    psycopg2.InterfaceError,
-)
-
-
 class _PooledConnection:
     def __enter__(self):
         pool = _get_pool()
@@ -128,8 +103,6 @@ class _PooledConnection:
         return self.conn
 
     def __exit__(self, exc_type, exc, tb):
-        broken = exc_type is not None and issubclass(exc_type, _FATAL_DB_ERRORS)
-
         if exc_type is None:
             try:
                 self.conn.commit()
@@ -139,25 +112,15 @@ class _PooledConnection:
                     self.conn.rollback()
                 except Exception:
                     pass
-                broken = isinstance(e, _FATAL_DB_ERRORS)
         else:
             try:
                 self.conn.rollback()
             except Exception:
-                broken = True
-
-        if broken:
-            try:
-                self._pool.putconn(self.conn, close=True)
-            except Exception:
                 pass
-            _reset_pool()
-        else:
-            try:
-                self._pool.putconn(self.conn)
-            except Exception as e:
-                logger.warning(f"Returning conn to pool failed: {e}")
-                _reset_pool()
+        try:
+            self._pool.putconn(self.conn)
+        except Exception as e:
+            logger.warning(f"Returning conn to pool failed: {e}")
         return False
 
 
@@ -245,7 +208,7 @@ def get_pending_payments():
         return []
 
 
-# ─── Stats helpers (read-only queries against shared Neon DB) ────────────────
+# ─── Stats helpers (read-only queries against shared Neon DB) ─────────────────
 
 def count_pending_payments() -> int:
     try:
@@ -539,6 +502,104 @@ async def pending_payments(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
 
 
+async def resend_invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Re-send a fresh invite link to an existing subscriber.
+
+    Calls the main bot's /api/resend_invite endpoint, which is the only
+    process that holds the bot token for the channels. Designed to recover
+    orphaned subscriptions whose original invite-link send failed.
+
+    Usage: /resend_invite <user_id> <tier>
+    """
+    if update.effective_user.id != ADMIN_USER_ID:
+        return
+
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "Usage: `/resend_invite <user_id> <tier>`\n\n"
+            "Example: `/resend_invite 1501159868 bronze`",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        target_user_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID. Must be a number.")
+        return
+
+    tier = context.args[1].lower()
+    if tier not in TIER_PRICES:
+        await update.message.reply_text("❌ Invalid tier. Use: bronze or gold")
+        return
+
+    try:
+        response = requests.post(
+            f"{MAIN_BOT_API_URL}/api/resend_invite",
+            json={
+                "user_id": target_user_id,
+                "tier": tier,
+                "api_key": SECRET_API_KEY,
+            },
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        logger.error(f"Could not reach main bot for /resend_invite: {e}")
+        await update.message.reply_text(
+            f"❌ *Could not reach the main bot*\n\n"
+            f"`{e}`\n\n"
+            f"Check that `MAIN_BOT_API_URL` ({MAIN_BOT_API_URL}) points at the running main bot.",
+            parse_mode="Markdown",
+        )
+        return
+
+    body = {}
+    try:
+        body = response.json() or {}
+    except Exception:
+        pass
+
+    tier_emoji = TIER_EMOJI.get(tier, "💳")
+
+    if response.status_code == 200 and body.get("invite_sent"):
+        expiry_str = body.get("expiry")
+        expiry_fmt = "—"
+        if expiry_str:
+            try:
+                expiry_fmt = datetime.fromisoformat(expiry_str).strftime("%d %b %Y")
+            except Exception:
+                expiry_fmt = expiry_str
+        await update.message.reply_text(
+            f"✅ *Invite link resent*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"👤 User: `{target_user_id}`\n"
+            f"{tier_emoji} Tier: *{tier.title()}*\n"
+            f"📅 Expires: {expiry_fmt}\n\n"
+            f"✨ The user has received a new invite DM.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if response.status_code == 404 or body.get("status") == "no_active_subscription":
+        await update.message.reply_text(
+            f"❌ User `{target_user_id}` has no active *{tier.title()}* subscription.\n\n"
+            f"Approve a payment for them first, then re-run this command.",
+            parse_mode="Markdown",
+        )
+        return
+
+    err = body.get("error") or response.text or f"HTTP {response.status_code}"
+    await update.message.reply_text(
+        f"❌ *Failed to resend invite*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 User: `{target_user_id}`\n"
+        f"{tier_emoji} Tier: *{tier.title()}*\n"
+        f"💥 Reason: `{err}`\n\n"
+        f"Common causes: bot is not a channel admin, user has blocked the bot.",
+        parse_mode="Markdown",
+    )
+
+
 # ─── Dashboard view builders (text + keyboard tuples) ────────────────────────
 
 def _build_pending_view():
@@ -666,7 +727,7 @@ def _build_stats_view():
     return text, _back_button()
 
 
-# ─── Master callback router ──────────────────────────────────────────────────
+# ─── Master callback router ────────────────────────────────────────────────
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -677,7 +738,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
-    # ─── Dashboard navigation ────────────────────────────────────────────
+    # ─── Dashboard navigation ──────────────────────────────────────────
     if data == "admin_back":
         await query.message.edit_text(
             _main_menu_text(),
@@ -711,7 +772,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
         return
 
-    # ─── Payment notification actions (existing flow) ────────────────────
+    # ─── Payment notification actions (existing flow) ─────────────────────
     if data.startswith("approve_"):
         payment_id = data.replace("approve_", "")
 
@@ -775,48 +836,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             },
             timeout=10
         )
-
+        
         if response.status_code == 200:
             mark_approved(payment_id)
             del context.user_data['approving_payment']
 
-            # Honest reporting: bot.py now returns invite_sent so we can
-            # tell the admin if the subscription saved but the DM failed
-            # (e.g. user blocked the bot, bot not channel admin, etc).
-            payload = {}
-            try:
-                payload = response.json() or {}
-            except Exception:
-                payload = {}
-            invite_sent = bool(payload.get("invite_sent"))
-            invite_error = payload.get("error")
-
             tier_emoji = TIER_EMOJI.get(tier, "💳")
-            if invite_sent:
-                await update.message.reply_text(
-                    f"✅ *Access Granted Successfully!*\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"{tier_emoji} *Tier:*     {tier.title()}\n"
-                    f"👤 *User:*     `{user_id}`\n"
-                    f"🔖 *Payment:* `{payment_id}`\n"
-                    f"📅 *Duration:* {TIER_DURATION_DAYS[tier]} days\n\n"
-                    f"✨ User has received their invite link.",
-                    parse_mode="Markdown"
-                )
-            else:
-                err_line = f"\n💥 Reason: `{invite_error}`" if invite_error else ""
-                await update.message.reply_text(
-                    f"⚠️ *Subscription saved — invite link NOT sent*\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"{tier_emoji} *Tier:*     {tier.title()}\n"
-                    f"👤 *User:*     `{user_id}`\n"
-                    f"🔖 *Payment:* `{payment_id}`\n"
-                    f"📅 *Duration:* {TIER_DURATION_DAYS[tier]} days"
-                    f"{err_line}\n\n"
-                    f"🛠️ *Recover:* run `/resend_invite {user_id} {tier}` "
-                    f"in the main bot to retry the invite.",
-                    parse_mode="Markdown",
-                )
+            await update.message.reply_text(
+                f"✅ *Access Granted Successfully!*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"{tier_emoji} *Tier:*     {tier.title()}\n"
+                f"👤 *User:*     `{user_id}`\n"
+                f"🔖 *Payment:* `{payment_id}`\n"
+                f"📅 *Duration:* {TIER_DURATION_DAYS[tier]} days\n\n"
+                f"✨ User has received their invite link.",
+                parse_mode="Markdown"
+            )
         else:
             await update.message.reply_text(
                 f"❌ Failed to grant subscription: {response.text}"
@@ -850,16 +885,18 @@ def main():
     admin_bot.add_handler(CommandHandler("pending", pending_payments))
     admin_bot.add_handler(CommandHandler("stats", stats_command))
     admin_bot.add_handler(CommandHandler("cancel", cancel))
+    admin_bot.add_handler(CommandHandler("resend_invite", resend_invite))
     admin_bot.add_handler(CallbackQueryHandler(button_handler))
     from telegram.ext import MessageHandler, filters
     admin_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     async def post_init(application):
         await application.bot.set_my_commands([
-            BotCommand("start",   "🛡️ Admin home & dashboard"),
-            BotCommand("pending", "📋 Review queued payments"),
-            BotCommand("stats",   "📊 Subscription overview"),
-            BotCommand("cancel",  "🚫 Abort current approval"),
+            BotCommand("start",         "🛡️ Admin home & dashboard"),
+            BotCommand("pending",       "📋 Review queued payments"),
+            BotCommand("stats",         "📊 Subscription overview"),
+            BotCommand("resend_invite", "📨 Resend an invite link"),
+            BotCommand("cancel",        "🚫 Abort current approval"),
         ])
         logger.info("✅ Admin bot commands registered")
 
