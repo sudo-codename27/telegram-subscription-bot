@@ -108,6 +108,11 @@ logger = logging.getLogger(__name__)
 
 def db_connect():
     """Open a connection to the subscriptions database (honors DB_PATH)."""
+    # Create directory if it doesn't exist
+    import os
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
     return sqlite3.connect(DB_PATH)
 
 # ─────────────────────────────────────────────
