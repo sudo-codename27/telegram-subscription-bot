@@ -551,7 +551,7 @@ def format_subscription_card(tier: str, expiry_str: str, started_str: str) -> st
     elif days_left == 1:
         status = "⚠️ Expires tomorrow!"
     else:
-        status = "⚠️ Expires today!"
+        status = "🚨 Expires today!"
 
     return (
         f"{emoji} *{tier.title()} — Active*\n"
@@ -659,10 +659,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "✨ *Welcome to Desire Musing!*\n\n"
         "Get access to premium content by choosing a plan below.\n\n"
-        "*_Payment is made with Telegram Stars ⭐ or Razorpay_* 💳\n\n"
-        "🥉 *Bronze Tier* - ⭐ 100 or ₹249 (for 2 months)\n"
-        "🥇 *Gold Tier* - ⭐ 250 or ₹509 (for 2 months)\n\n"
-        "👇 *SELECT YOUR DESIRED PLAN:*",
+        "Payment is made with ⭐*Telegram Stars* or 💳*Razorpay*\n\n"
+        "🥉 *Bronze Tier*\n" 
+        "⭐ 100 or ₹249 *(for 2 months)*\n\n"
+        "🥇 *Gold Tier*\n"
+        "⭐ 250 or ₹509 *(for 2 months)*\n\n"
+        "👇 *SELECT YOUR DESIRE* 🤤🫦",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
@@ -674,7 +676,7 @@ async def membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not subs:
         await update.message.reply_text(
-            "❌ *You have no active subscriptions.*\n\n"
+            "❌ 🙅‍♂️ *You have no active subscriptions.*\n\n"
             "Use /start to get access to exclusive content!",
             parse_mode="Markdown",
         )
@@ -682,7 +684,7 @@ async def membership(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = [format_subscription_card(tier, expiry, started) for tier, expiry, started in subs]
     await update.message.reply_text(
-        "📋 *Your Subscriptions:*\n\n" + "\n\n".join(lines),
+        "📱 *Your Subscriptions:*\n\n" + "\n\n".join(lines),
         parse_mode="Markdown",
     )
 
@@ -693,17 +695,19 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "To check your Stars balance open Telegram and go to:\n"
         "*Settings → My Stars*\n\n"
         "Your balance is shown at the top of that screen.\n\n"
-        "💡 *Our prices:*\n"
-        "🥉 *Bronze Tier* - ⭐ 100 or ₹249 (for 2 months)\n"
-        "🥇 *Gold Tier* - ⭐ 250 or ₹509 (for 2 months)\n\n"
+        "📜 *Our prices:*\n"
+        "🥉 *Bronze Tier*\n" 
+        "⭐ 100 or ₹249 *(for 2 months)*\n\n"
+        "🥇 *Gold Tier*\n"
+        "⭐ 250 or ₹509 *(for 2 months)*\n\n"
         "Use /start when you're ready!",
         parse_mode="Markdown",
     )
 
 async def select_payment_method(update: Update, context: ContextTypes.DEFAULT_TYPE, tier: str):
     keyboard = [
-        [InlineKeyboardButton("⭐ Telegram Stars", callback_data=f"pay_stars_{tier}")],
-        [InlineKeyboardButton("💳 Razorpay (UPI/Card/NetBanking)", callback_data=f"pay_razorpay_{tier}")],
+        [InlineKeyboardButton("⭐ *TELEGRAM STARS*", callback_data=f"pay_stars_{tier}")],
+        [InlineKeyboardButton("💳 *RAZORPAY* (UPI/Card/NetBanking)", callback_data=f"pay_razorpay_{tier}")],
         [InlineKeyboardButton("« Back", callback_data="back_to_start")]
     ]
     
@@ -745,10 +749,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.message.edit_text(
             "✨ *Welcome to Desire Musing!*\n\n"
-            "Get exclusive access to premium content by choosing a plan below.\n\n"
-            "🥉 *Bronze Tier* - ⭐ 100 or ₹249 (for 2 months)\n"
-            "🥇 *Gold Tier* - ⭐ 250 or ₹509 (for 2 months)\n\n"
-            "👇 Select your plan to get started:",
+            "Get access to premium content by choosing a plan below.\n\n"
+            "Payment is made with ⭐*Telegram Stars* or 💳*Razorpay*\n\n"
+            "🥉 *Bronze Tier*\n" 
+            "⭐ 100 or ₹249 *(for 2 months)*\n\n"
+            "🥇 *Gold Tier*\n"
+            "⭐ 250 or ₹509 *(for 2 months)*\n\n"
+            "👇 *SELECT YOUR DESIRE* 🤤🫦",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
@@ -841,7 +848,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if days_left > 1:
                 await query.message.reply_text(
-                    f"⚠️ *You already have an active {tier.title()} subscription!*\n\n"
+                    f"ℹ️ *You already have an active {tier.title()} subscription!*\n\n"
                     f"Expires: *{exp_dt.strftime('%d %b %Y')}* ({days_left} days left)\n\n"
                     f"You can renew in the last 24 hours of your plan.\n"
                     f"No payment needed right now — you're all set! 🎉",
@@ -863,7 +870,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Failed to send invoice to user {user_id}: {e}")
             await query.message.reply_text(
-                "❌ Failed to generate payment invoice. Please try again or contact support."
+                "❌ Failed to generate payment invoice. Please try again or contact support.\n"
+                "Admin: *@desiremusings*"
             )
 
 async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -914,8 +922,8 @@ async def successful_payment_handler(update: Update, context: ContextTypes.DEFAU
     if charge_id_already_used(charge_id):
         logger.warning(f"Duplicate charge_id {charge_id} ignored for user {user_id}")
         await update.message.reply_text(
-            "⚠️ This payment was already processed.\n"
-            "Use /membership to check your subscription status."
+            "📢❗🚨 This payment was already processed.\n"
+            "ℹ️ Use /membership to check your subscription status."
         )
         return
 
@@ -1140,10 +1148,10 @@ async def check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(response, parse_mode="Markdown")
 
     except ValueError:
-        await update.message.reply_text("❌ Invalid user ID. Must be a number.")
+        await update.message.reply_text("✋🏻🛑⛔️ Invalid user ID. Must be a number.")
     except Exception as e:
         logger.error(f"Error in check command: {e}")
-        await update.message.reply_text(f"❌ Error: {e}")
+        await update.message.reply_text(f"⛔ Error: {e}")
 
 # ─────────────────────────────────────────────
 #  DAILY EXPIRY CHECK
@@ -1214,9 +1222,9 @@ def main():
     async def post_init(application):
         global WEBHOOK_PORT
         await application.bot.set_my_commands([
-            BotCommand("start", "🚀subscription plans"),
-            BotCommand("membership", "✅Check your active subscriptions"),
-            BotCommand("balance", "⭐How to check your Stars balance"),
+            BotCommand("start", "🚀*SUBSCRIPTION PLAN*"),
+            BotCommand("membership", "✅*CHECK ACTIVE SUBSCRIPTION*"),
+            BotCommand("balance", "*STEPS TO CHECK ⭐-BALANCE*"),
         ])
         
         scheduler = AsyncIOScheduler()
