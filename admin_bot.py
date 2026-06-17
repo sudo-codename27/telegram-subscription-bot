@@ -3,7 +3,7 @@ import os
 import psycopg2
 from psycopg2 import pool as pg_pool
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -53,6 +53,11 @@ TIER_PRICES = {
 TIER_DURATION_DAYS = {
     "bronze": 60,
     "gold": 60,
+}
+
+TIER_EMOJI = {
+    "bronze": "🥉",
+    "gold": "🥇",
 }
 
 logging.basicConfig(
@@ -202,6 +207,107 @@ def get_pending_payments():
         logger.error(f"Database error in get_pending_payments: {e}")
         return []
 
+
+# ─── Stats helpers (read-only queries against shared Neon DB) ────────────────
+
+def count_pending_payments() -> int:
+    try:
+        with _db() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM pending_payments WHERE status = 'pending'"
+                )
+                row = cur.fetchone()
+                return int(row[0]) if row else 0
+    except Exception as e:
+        logger.error(f"Database error in count_pending_payments: {e}")
+        return 0
+
+
+def count_active_by_tier(tier: str) -> int:
+    """Count subscribers whose subscription hasn't expired yet."""
+    try:
+        with _db() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    """SELECT COUNT(*) FROM subscriptions
+                       WHERE tier = %s AND expiry > %s""",
+                    (tier, datetime.now().isoformat()),
+                )
+                row = cur.fetchone()
+                return int(row[0]) if row else 0
+    except Exception as e:
+        # Table may not exist yet if main bot hasn't run init_db. Treat as 0.
+        logger.warning(f"count_active_by_tier({tier}) failed: {e}")
+        return 0
+
+
+def count_banned_users() -> int:
+    try:
+        with _db() as con:
+            with con.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM blacklist")
+                row = cur.fetchone()
+                return int(row[0]) if row else 0
+    except Exception as e:
+        logger.warning(f"count_banned_users failed: {e}")
+        return 0
+
+
+def list_subscribers_by_tier(tier: str, limit: int = 20):
+    """Return (user_id, expiry, started_at) for active subscribers of a tier."""
+    try:
+        with _db() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    """SELECT user_id, expiry, started_at FROM subscriptions
+                       WHERE tier = %s AND expiry > %s
+                       ORDER BY expiry ASC LIMIT %s""",
+                    (tier, datetime.now().isoformat(), limit),
+                )
+                return cur.fetchall()
+    except Exception as e:
+        logger.warning(f"list_subscribers_by_tier({tier}) failed: {e}")
+        return []
+
+
+def list_banned_users(limit: int = 20):
+    """Return (user_id, reason, banned_at) of banned users."""
+    try:
+        with _db() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    """SELECT user_id, reason, banned_at FROM blacklist
+                       ORDER BY banned_at DESC LIMIT %s""",
+                    (limit,),
+                )
+                return cur.fetchall()
+    except Exception as e:
+        logger.warning(f"list_banned_users failed: {e}")
+        return []
+
+
+def get_recent_payments_summary(days: int = 30):
+    """Return (count, total_stars) for successful payments in the last N days."""
+    try:
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        with _db() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    """SELECT COUNT(*), COALESCE(SUM(stars), 0)
+                       FROM payments_log
+                       WHERE paid_at > %s AND status IN ('success', 'razorpay_captured', 'razorpay_admin_approved')""",
+                    (cutoff,),
+                )
+                row = cur.fetchone()
+                if row:
+                    return int(row[0]), int(row[1] or 0)
+                return 0, 0
+    except Exception as e:
+        logger.warning(f"get_recent_payments_summary failed: {e}")
+        return 0, 0
+
+
 # ─────────────────────────────────────────────
 #  FLASK WEBHOOK SERVER
 # ─────────────────────────────────────────────
@@ -285,18 +391,24 @@ async def _notify_admin(payment_id, amount, email, contact, user_id, tier):
                 InlineKeyboardButton("❌ Reject", callback_data=f"reject_{payment_id}")
             ]
         ]
-        
+
+        tier_emoji = TIER_EMOJI.get((tier or "").lower(), "💳")
+        received_at = datetime.now().strftime("%d %b %H:%M")
+
         message = (
-            f"💳 *New Razorpay Payment*\n\n"
-            f"Payment ID: `{payment_id}`\n"
-            f"Amount: *₹{amount // 100}*\n"
-            f"Email: {email}\n"
-            f"Contact: {contact}\n\n"
-            f"User ID: `{user_id or 'Not provided'}`\n"
-            f"Tier: {tier or 'Not provided'}\n\n"
-            f"⚠️ Action required!"
+            f"🚨 *NEW PAYMENT RECEIVED*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{tier_emoji} *Tier:*       {(tier or 'Not provided').title()}\n"
+            f"💰 *Amount:*    ₹{amount // 100}\n"
+            f"🕐 *Received:*  {received_at}\n\n"
+            f"👤 *User ID:*   `{user_id or 'Not provided'}`\n"
+            f"📧 *Email:*       {email}\n"
+            f"📱 *Contact:*   {contact}\n"
+            f"🔖 *Payment:*  `{payment_id}`\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👇 *Take action:*"
         )
-        
+
         await admin_bot.bot.send_message(
             chat_id=ADMIN_USER_ID,
             text=message,
@@ -308,74 +420,289 @@ async def _notify_admin(payment_id, amount, email, contact, user_id, tier):
         logger.error(f"Failed to notify admin: {e}")
 
 # ─────────────────────────────────────────────
-#  BOT HANDLERS
+#  BOT HANDLERS — DASHBOARD UI
 # ─────────────────────────────────────────────
+
+def _build_main_menu_keyboard():
+    """Build the main admin menu with live count badges."""
+    pending = count_pending_payments()
+    bronze = count_active_by_tier("bronze")
+    gold = count_active_by_tier("gold")
+    banned = count_banned_users()
+
+    pending_label = f"📋 Pending Payments ({pending})" if pending else "📋 Pending Payments"
+    banned_label = f"🚫 Banned Users ({banned})" if banned else "🚫 Banned Users"
+
+    keyboard = [
+        [InlineKeyboardButton(pending_label, callback_data="admin_pending")],
+        [InlineKeyboardButton(f"🥉 Bronze — {bronze} active", callback_data="admin_tier_bronze")],
+        [InlineKeyboardButton(f"🥇 Gold — {gold} active", callback_data="admin_tier_gold")],
+        [InlineKeyboardButton(banned_label, callback_data="admin_banned")],
+        [InlineKeyboardButton("📊 Subscription Stats", callback_data="admin_stats")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def _main_menu_text():
+    return (
+        "🛡️ *Admin Control Panel*\n\n"
+        "Welcome back. Here's your dashboard.\n\n"
+        "📊 Quick actions below\n"
+        "🔔 You'll be notified of new payments\n"
+        "⚡ Tap any button to drill in\n\n"
+        "👇 *ADMIN ACTIONS:*"
+    )
+
+
+def _back_button():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("« Back to Menu", callback_data="admin_back")]])
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_USER_ID:
         return
-    
+
     await update.message.reply_text(
-        "🔐 *Admin Payment Approval Bot*\n\n"
-        "I'll notify you when Razorpay payments are received.\n\n"
-        "Commands:\n"
-        "/pending - View pending payments\n"
-        "/start - This message",
-        parse_mode="Markdown"
+        _main_menu_text(),
+        parse_mode="Markdown",
+        reply_markup=_build_main_menu_keyboard(),
     )
 
-async def pending_payments(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Abort an in-progress payment approval (clears pending state)."""
     if update.effective_user.id != ADMIN_USER_ID:
         return
-    
-    pending = get_pending_payments()
-    
-    if not pending:
-        await update.message.reply_text("✅ No pending payments.")
-        return
-    
-    response = "📋 *Pending Payments:*\n\n"
-    
-    for payment_id, amount, email, contact, user_id, tier, received_at in pending:
-        response += (
-            f"💳 `{payment_id}`\n"
-            f"   ₹{amount // 100} | {tier or 'N/A'}\n"
-            f"   User: `{user_id or 'N/A'}`\n"
-            f"   {datetime.fromisoformat(received_at).strftime('%d %b %H:%M')}\n\n"
+
+    if 'approving_payment' in context.user_data:
+        payment_id = context.user_data.pop('approving_payment')
+        await update.message.reply_text(
+            f"🚫 *Approval cancelled*\n"
+            f"Payment `{payment_id}` left pending.\n\n"
+            f"Use the notification or /pending to retry.",
+            parse_mode="Markdown",
         )
-    
-    await update.message.reply_text(response, parse_mode="Markdown")
+    else:
+        await update.message.reply_text("ℹ️ Nothing to cancel.")
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Render the stats card directly via /stats."""
+    if update.effective_user.id != ADMIN_USER_ID:
+        return
+    text, keyboard = _build_stats_view()
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+async def pending_payments(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Legacy /pending command — same content as the dashboard button."""
+    if update.effective_user.id != ADMIN_USER_ID:
+        return
+    text, keyboard = _build_pending_view()
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+
+# ─── Dashboard view builders (text + keyboard tuples) ────────────────────────
+
+def _build_pending_view():
+    pending = get_pending_payments()
+    if not pending:
+        text = (
+            "📋 *Pending Payments*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "✅ No pending payments right now.\n\n"
+            "New Razorpay payments will appear here automatically."
+        )
+        return text, _back_button()
+
+    lines = [f"📋 *Pending Payments* ({len(pending)})", "━━━━━━━━━━━━━━━━━━━━", ""]
+    for payment_id, amount, email, contact, user_id, tier, received_at in pending:
+        tier_emoji = TIER_EMOJI.get((tier or "").lower(), "💳")
+        try:
+            ts = datetime.fromisoformat(received_at).strftime("%d %b %H:%M")
+        except Exception:
+            ts = received_at or "N/A"
+        lines.append(
+            f"{tier_emoji} *{(tier or 'N/A').title()}* — ₹{amount // 100}\n"
+            f"   👤 User: `{user_id or 'N/A'}`\n"
+            f"   🕐 {ts}\n"
+            f"   🔖 `{payment_id}`\n"
+        )
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("💡 Tap a payment notification to approve.")
+    return "\n".join(lines), _back_button()
+
+
+def _build_tier_view(tier: str):
+    tier_emoji = TIER_EMOJI.get(tier, "💳")
+    rows = list_subscribers_by_tier(tier)
+
+    if not rows:
+        text = (
+            f"{tier_emoji} *{tier.title()} Subscribers*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"No active {tier} subscribers yet."
+        )
+        return text, _back_button()
+
+    lines = [
+        f"{tier_emoji} *{tier.title()} Subscribers* ({len(rows)})",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+    ]
+    for user_id, expiry_str, started_str in rows:
+        try:
+            exp_dt = datetime.fromisoformat(expiry_str)
+            days_left = (exp_dt - datetime.now()).days
+            exp_fmt = exp_dt.strftime("%d %b %Y")
+        except Exception:
+            exp_fmt = expiry_str or "N/A"
+            days_left = "?"
+        try:
+            started_fmt = datetime.fromisoformat(started_str).strftime("%d %b %Y")
+        except Exception:
+            started_fmt = started_str or "N/A"
+        lines.append(
+            f"👤 `{user_id}`\n"
+            f"   📅 Expires: {exp_fmt} ({days_left} days)\n"
+            f"   🕐 Started: {started_fmt}\n"
+        )
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("💡 Showing up to 20 subscribers, sorted by expiry.")
+    return "\n".join(lines), _back_button()
+
+
+def _build_banned_view():
+    rows = list_banned_users()
+    if not rows:
+        text = (
+            "🚫 *Banned Users*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "✅ No users are currently banned."
+        )
+        return text, _back_button()
+
+    lines = [f"🚫 *Banned Users* ({len(rows)})", "━━━━━━━━━━━━━━━━━━━━", ""]
+    for user_id, reason, banned_at in rows:
+        try:
+            ts = datetime.fromisoformat(banned_at).strftime("%d %b %Y")
+        except Exception:
+            ts = banned_at or "N/A"
+        reason_str = reason or "(no reason)"
+        if len(reason_str) > 60:
+            reason_str = reason_str[:57] + "..."
+        lines.append(
+            f"👤 `{user_id}`\n"
+            f"   📝 {reason_str}\n"
+            f"   🕐 Banned: {ts}\n"
+        )
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("💡 Use /unban <user_id> in the main bot to remove a ban.")
+    return "\n".join(lines), _back_button()
+
+
+def _build_stats_view():
+    pending = count_pending_payments()
+    bronze = count_active_by_tier("bronze")
+    gold = count_active_by_tier("gold")
+    banned = count_banned_users()
+    total_active = bronze + gold
+
+    payments_30d, stars_30d = get_recent_payments_summary(30)
+
+    text = (
+        f"📊 *Subscription Overview*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🟢 *Active subscriptions*\n"
+        f"   🥉 Bronze: {bronze}\n"
+        f"   🥇 Gold: {gold}\n"
+        f"   ━━━━━━━━━━\n"
+        f"   Total: *{total_active}*\n\n"
+        f"📋 *Pending payments:* {pending}\n"
+        f"🚫 *Banned users:* {banned}\n\n"
+        f"💰 *Last 30 days*\n"
+        f"   Payments: {payments_30d}\n"
+        f"   Stars: ⭐ {stars_30d}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"_Counts are live from the database._"
+    )
+    return text, _back_button()
+
+
+# ─── Master callback router ──────────────────────────────────────────────────
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
+
     if update.effective_user.id != ADMIN_USER_ID:
         return
-    
+
     data = query.data
-    
+
+    # ─── Dashboard navigation ────────────────────────────────────────────
+    if data == "admin_back":
+        await query.message.edit_text(
+            _main_menu_text(),
+            parse_mode="Markdown",
+            reply_markup=_build_main_menu_keyboard(),
+        )
+        return
+
+    if data == "admin_pending":
+        text, keyboard = _build_pending_view()
+        await query.message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        return
+
+    if data == "admin_tier_bronze":
+        text, keyboard = _build_tier_view("bronze")
+        await query.message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        return
+
+    if data == "admin_tier_gold":
+        text, keyboard = _build_tier_view("gold")
+        await query.message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        return
+
+    if data == "admin_banned":
+        text, keyboard = _build_banned_view()
+        await query.message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        return
+
+    if data == "admin_stats":
+        text, keyboard = _build_stats_view()
+        await query.message.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+        return
+
+    # ─── Payment notification actions (existing flow) ────────────────────
     if data.startswith("approve_"):
         payment_id = data.replace("approve_", "")
-        
-        # Ask for user_id and tier
+
         await query.message.reply_text(
-            f"💳 Approving payment: `{payment_id}`\n\n"
-            f"Please reply with:\n"
+            f"💳 *Approving payment*\n"
+            f"🔖 `{payment_id}`\n\n"
+            f"📝 Reply with the user details:\n"
             f"`<user_id> <tier>`\n\n"
-            f"Example: `123456789 bronze`",
+            f"📌 *Examples:*\n"
+            f"• `12345 bronze` — Bronze tier\n"
+            f"• `67890 gold` — Gold tier\n\n"
+            f"Send /cancel to abort.",
             parse_mode="Markdown"
         )
         context.user_data['approving_payment'] = payment_id
-        
-    elif data.startswith("reject_"):
+        return
+
+    if data.startswith("reject_"):
         payment_id = data.replace("reject_", "")
         mark_approved(payment_id)  # Mark as processed
-        
+
         await query.message.edit_text(
-            f"❌ Payment rejected: `{payment_id}`",
+            f"❌ *Payment rejected*\n"
+            f"🔖 `{payment_id}`",
             parse_mode="Markdown"
         )
+        return
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_USER_ID:
@@ -415,13 +742,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if response.status_code == 200:
             mark_approved(payment_id)
             del context.user_data['approving_payment']
-            
+
+            tier_emoji = TIER_EMOJI.get(tier, "💳")
             await update.message.reply_text(
-                f"✅ *Subscription Granted!*\n\n"
-                f"User: `{user_id}`\n"
-                f"Tier: {tier.title()}\n"
-                f"Payment: `{payment_id}`\n\n"
-                f"User has been notified and given access.",
+                f"✅ *Access Granted Successfully!*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"{tier_emoji} *Tier:*     {tier.title()}\n"
+                f"👤 *User:*     `{user_id}`\n"
+                f"🔖 *Payment:* `{payment_id}`\n"
+                f"📅 *Duration:* {TIER_DURATION_DAYS[tier]} days\n\n"
+                f"✨ User has received their invite link.",
                 parse_mode="Markdown"
             )
         else:
@@ -455,10 +785,23 @@ def main():
     
     admin_bot.add_handler(CommandHandler("start", start))
     admin_bot.add_handler(CommandHandler("pending", pending_payments))
+    admin_bot.add_handler(CommandHandler("stats", stats_command))
+    admin_bot.add_handler(CommandHandler("cancel", cancel))
     admin_bot.add_handler(CallbackQueryHandler(button_handler))
     from telegram.ext import MessageHandler, filters
     admin_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
+
+    async def post_init(application):
+        await application.bot.set_my_commands([
+            BotCommand("start",   "🛡️ Admin home & dashboard"),
+            BotCommand("pending", "📋 Review queued payments"),
+            BotCommand("stats",   "📊 Subscription overview"),
+            BotCommand("cancel",  "🚫 Abort current approval"),
+        ])
+        logger.info("✅ Admin bot commands registered")
+
+    admin_bot.post_init = post_init
+
     webhook_thread = threading.Thread(target=run_webhook_server, daemon=True)
     webhook_thread.start()
     
