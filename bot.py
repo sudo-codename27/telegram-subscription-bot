@@ -78,6 +78,7 @@ CHANNEL_TO_TIER = {v: k for k, v in TIER_CHANNELS.items()}
 RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "")
 RAZORPAY_BRONZE_PAGE = os.environ.get("RAZORPAY_BRONZE_PAGE", "")
 RAZORPAY_GOLD_PAGE = os.environ.get("RAZORPAY_GOLD_PAGE", "")
+WEBHOOK_PORT = int(os.environ.get("PORT", 8080))
 
 RAZORPAY_PRICES = {
     "bronze": 24900,  # ₹249 for 2 months
@@ -108,11 +109,6 @@ logger = logging.getLogger(__name__)
 
 def db_connect():
     """Open a connection to the subscriptions database (honors DB_PATH)."""
-    # Create directory if it doesn't exist
-    import os
-    db_dir = os.path.dirname(DB_PATH)
-    if db_dir and not os.path.exists(db_dir):
-        os.makedirs(db_dir, exist_ok=True)
     return sqlite3.connect(DB_PATH)
 
 # ─────────────────────────────────────────────
@@ -1101,6 +1097,7 @@ async def check_expiries(app):
 # ─────────────────────────────────────────────
 
 def run_webhook_server():
+    global WEBHOOK_PORT
     logger.info(f"Starting webhook server on port {WEBHOOK_PORT}...")
     webhook_app.run(host='0.0.0.0', port=WEBHOOK_PORT, debug=False, use_reloader=False)
 
@@ -1127,6 +1124,7 @@ def main():
     bot_app.add_handler(ChatJoinRequestHandler(approve_join_request))
 
     async def post_init(application):
+        global WEBHOOK_PORT
         await application.bot.set_my_commands([
             BotCommand("start", "🏠 Main menu & subscription plans"),
             BotCommand("membership", "📋 Check your active subscriptions"),
