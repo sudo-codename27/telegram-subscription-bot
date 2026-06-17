@@ -78,7 +78,6 @@ CHANNEL_TO_TIER = {v: k for k, v in TIER_CHANNELS.items()}
 RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "")
 RAZORPAY_BRONZE_PAGE = os.environ.get("RAZORPAY_BRONZE_PAGE", "")
 RAZORPAY_GOLD_PAGE = os.environ.get("RAZORPAY_GOLD_PAGE", "")
-WEBHOOK_PORT = int(os.environ.get("PORT", 8080))
 
 RAZORPAY_PRICES = {
     "bronze": 24900,  # ₹249 for 2 months
