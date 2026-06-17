@@ -19,13 +19,13 @@ A Telegram bot that manages paid subscriptions with **Telegram Stars** and **Raz
 ```
 Razorpay Payment
       ↓
-Admin Bot (Port 5001) ← Webhook
+Admin Bot ← Webhook
       ↓
 📱 Telegram Notification to Admin
       ↓
-Admin clicks "✅ Approve"
+Admin clicks "✅ Approve" and replies `<user_id> <tier>`
       ↓
-Admin Bot → Secure API → Main Bot (Port 5000)
+Admin Bot → POST /api/grant_subscription (Secret API key) → Main Bot
       ↓
 Main Bot grants subscription
       ↓
@@ -41,6 +41,38 @@ User gets invite link!
 
 ---
 
+## 🔐 Environment Variables
+
+> **Never commit real secrets.** `.env` and `.env.admin` are git-ignored and
+> are only used for local development. On Railway, set every value below in the
+> service's **Variables** tab — do **not** upload a `.env` file.
+
+### Main bot (`bot.py`)
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `BOT_TOKEN` | ✅ | Main bot token from @BotFather. |
+| `ADMIN_USER_ID` | ✅ | Your numeric Telegram user ID (admin commands). |
+| `SECRET_API_KEY` | ✅ | Shared secret that authenticates the admin bot's `/api/grant_subscription` calls. **Must be identical** in both services. |
+| `RAZORPAY_BRONZE_PAGE` | ✅ | Razorpay payment page URL for the Bronze tier. |
+| `RAZORPAY_GOLD_PAGE` | ✅ | Razorpay payment page URL for the Gold tier. |
+| `RAZORPAY_WEBHOOK_SECRET` | optional | HMAC secret to verify Razorpay webhooks (if the main bot receives them directly). |
+| `PORT` | auto | Web server port. Railway injects this automatically. |
+| `DB_PATH` | optional | Path to subscriptions database. Defaults to `subscriptions.db`. On Railway with volume, set to `/data/subscriptions.db`. |
+
+### Admin bot (`admin_bot.py`)
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `ADMIN_BOT_TOKEN` | ✅ | Admin bot token from @BotFather (a second bot). |
+| `ADMIN_USER_ID` | ✅ | Your numeric Telegram user ID. |
+| `SECRET_API_KEY` | ✅ | **Same value** as the main bot's `SECRET_API_KEY`. |
+| `MAIN_BOT_API_URL` | ✅ | Public URL of the main bot service, e.g. `https://your-main-bot.up.railway.app`. |
+| `RAZORPAY_WEBHOOK_SECRET` | ✅ | Same value configured in the Razorpay dashboard. |
+| `PORT` | auto | Web server port. Railway injects this; falls back to `ADMIN_PORT`, then `8081` locally. |
+
+---
+
 ## 🚂 Railway Deployment (Recommended for Production)
 
 ### 1️⃣ Deploy to Railway
@@ -52,40 +84,42 @@ User gets invite link!
 
 ### 2️⃣ Configure Main Bot Service
 
-In Railway dashboard → Your service → **Variables** tab:
+In Railway dashboard → Your service → **Variables** tab (placeholders — use your real values):
 
 ```bash
 BOT_TOKEN=your_main_bot_token_here
 ADMIN_USER_ID=your_telegram_user_id
+SECRET_API_KEY=generate_random_secure_key_here
 RAZORPAY_BRONZE_PAGE=https://rzp.io/rzp/YOUR_BRONZE_PAGE
 RAZORPAY_GOLD_PAGE=https://rzp.io/rzp/YOUR_GOLD_PAGE
 RAZORPAY_WEBHOOK_SECRET=whsec_your_webhook_secret
-SECRET_API_KEY=generate_random_secure_key_here
-PORT=5000
 ```
 
-**Railway will provide you a URL like:** `https://your-main-bot.up.railway.app`
+> You do **not** need to set `PORT` — Railway provides it automatically.
+> Under **Settings → Networking**, click **Generate Domain** to get a public URL
+> like `https://your-main-bot.up.railway.app`. Copy it — the admin bot needs it.
 
 ### 3️⃣ Deploy Admin Bot (Second Service)
 
 1. Click **"New"** → **"GitHub Repo"**
 2. Select **same repository**: `ankit-mandal/final_telegram`
-3. Go to **Settings** → **Start Command**:
+3. Go to **Settings** → **Custom Start Command**:
    ```
    python admin_bot.py
    ```
-4. Add environment variables:
+4. Add environment variables (placeholders — use your real values):
 
 ```bash
 ADMIN_BOT_TOKEN=your_admin_bot_token_here
 ADMIN_USER_ID=your_telegram_user_id
-ADMIN_PORT=5001
 SECRET_API_KEY=same_as_main_bot_secret_key
 MAIN_BOT_API_URL=https://your-main-bot.up.railway.app
 RAZORPAY_WEBHOOK_SECRET=same_as_main_bot_webhook_secret
 ```
 
-**Railway will provide you a URL like:** `https://your-admin-bot.up.railway.app`
+> The admin web server binds to Railway's `$PORT` automatically. Under
+> **Settings → Networking**, **Generate Domain** to get a URL like
+> `https://your-admin-bot.up.railway.app`.
 
 ### 4️⃣ Configure Razorpay Webhook
 
@@ -96,12 +130,28 @@ RAZORPAY_WEBHOOK_SECRET=same_as_main_bot_webhook_secret
 5. **Secret**: Use the same value as `RAZORPAY_WEBHOOK_SECRET`
 6. Save
 
-### 5️⃣ Test Your Deployment
+### 5️⃣ Persisting subscription data (Railway volume)
+
+The main bot's `subscriptions.db` holds paid subscriptions, so it must survive
+redeploys. On the **main bot service**:
+
+1. **Settings → Volumes → New Volume**, mount path: `/data`
+2. **Variables** tab, add: `DB_PATH=/data/subscriptions.db`
+3. Redeploy.
+
+A subscriptions DB is only KBs–MBs, so it fits comfortably within the Free
+tier's **0.5 GB volume** allowance.
+
+> The admin bot's `admin_payments.db` is a transient approval queue and does
+> **not** need a volume — it repopulates from incoming Razorpay webhooks.
+
+### 6️⃣ Test Your Deployment
 
 1. Message your main bot: `/start`
 2. Select a tier and payment method
 3. Complete a test payment
-4. Admin bot should notify you!
+4. Admin bot notifies you → click **✅ Approve** → reply `<user_id> <tier>`
+5. The user receives their invite link!
 
 ---
 
@@ -139,11 +189,11 @@ Create `.env` file:
 ```bash
 BOT_TOKEN=your_main_bot_token
 ADMIN_USER_ID=your_user_id
+SECRET_API_KEY=your_secret_key
 RAZORPAY_BRONZE_PAGE=https://rzp.io/rzp/bronze_page
 RAZORPAY_GOLD_PAGE=https://rzp.io/rzp/gold_page
 RAZORPAY_WEBHOOK_SECRET=whsec_secret
-SECRET_API_KEY=your_secret_key
-PORT=5000
+PORT=8080
 ```
 
 Create `.env.admin` file:
@@ -151,11 +201,15 @@ Create `.env.admin` file:
 ```bash
 ADMIN_BOT_TOKEN=your_admin_bot_token
 ADMIN_USER_ID=your_user_id
-ADMIN_PORT=5001
 SECRET_API_KEY=same_as_main_bot
-MAIN_BOT_API_URL=http://localhost:5000
+MAIN_BOT_API_URL=http://localhost:8080
 RAZORPAY_WEBHOOK_SECRET=same_as_main_bot
+ADMIN_PORT=8081
 ```
+
+> Locally, set `PORT` (main bot) and `ADMIN_PORT` (admin bot) to different
+> values so the two Flask servers don't collide. On Railway each service gets
+> its own `$PORT`, so this is handled automatically.
 
 ### 5️⃣ Start with Ngrok (for local testing)
 
@@ -171,7 +225,7 @@ python admin_bot.py
 
 **Terminal 3 - Ngrok for Admin Bot:**
 ```bash
-ngrok http 5001
+ngrok http 8081
 ```
 
 Update Razorpay webhook URL to ngrok URL.
@@ -192,7 +246,7 @@ Update Razorpay webhook URL to ngrok URL.
 2. Sends you a Telegram message with payment details
 3. You click **✅ Approve**
 4. Reply with: `<user_id> <tier>` (e.g., `123456789 bronze`)
-5. Admin bot tells main bot to grant subscription
+5. Admin bot calls the main bot's `/api/grant_subscription` endpoint
 6. User gets invite link!
 
 ---
@@ -221,7 +275,7 @@ Update Razorpay webhook URL to ngrok URL.
 
 ## 💰 Pricing Configuration
 
-Edit these in `bot.py` (around line 50-80):
+Edit these in `bot.py`:
 
 ```python
 # Telegram Stars Prices
@@ -232,8 +286,8 @@ TIER_PRICES = {
 
 # Razorpay Prices (in paise)
 RAZORPAY_PRICES = {
-    "bronze": 8000,   # ₹80.00
-    "gold": 20000,    # ₹200.00
+    "bronze": 24900,   # ₹249.00
+    "gold": 50900,     # ₹509.00
 }
 
 # Duration (in days)
@@ -302,7 +356,7 @@ TIER_DURATION_DAYS = {
 - ✅ User blacklist system
 - ✅ Rate limiting on button presses
 - ✅ Single-use invite links with expiry
-- ✅ Secure API key for bot-to-bot communication
+- ✅ Secret API key for bot-to-bot communication (`/api/grant_subscription`)
 - ✅ Separate admin bot (never exposed to users)
 - ✅ `.env` file protection via `.gitignore`
 
@@ -329,11 +383,11 @@ TIER_DURATION_DAYS = {
 - Start conversation with admin bot first (`/start`)
 - Check Railway logs for errors
 
-### API communication failing
+### "Failed to grant subscription" after approving
 
-- Ensure `SECRET_API_KEY` is **identical** in both bots
-- Check `MAIN_BOT_API_URL` points to correct Railway URL
-- Verify both services are running in Railway dashboard
+- Ensure `SECRET_API_KEY` is **identical** in both services (a mismatch returns `401 Unauthorized`)
+- Check `MAIN_BOT_API_URL` points to the main bot's public Railway URL
+- Verify both services are running in the Railway dashboard
 
 ---
 
@@ -342,16 +396,16 @@ TIER_DURATION_DAYS = {
 ```
 final_telegram/
 │
-├── bot.py                 # Main user-facing bot
-├── admin_bot.py          # Admin payment approval bot
+├── bot.py                 # Main user-facing bot (+ /api/grant_subscription)
+├── admin_bot.py           # Admin payment approval bot
 ├── requirements.txt       # Python dependencies
-├── Procfile              # Railway start command
-├── runtime.txt           # Python version for Railway
-├── railway.json          # Railway configuration
-├── .gitignore           # Git ignore rules
-├── README.md            # This file
-├── subscriptions.db     # Main bot database (auto-created)
-└── admin_payments.db    # Admin bot database (auto-created)
+├── Procfile               # Railway start command
+├── runtime.txt            # Python version for Railway
+├── railway.json           # Railway configuration
+├── .gitignore             # Git ignore rules
+├── README.md              # This file
+├── subscriptions.db       # Main bot database (auto-created)
+└── admin_payments.db      # Admin bot database (auto-created)
 ```
 
 ---

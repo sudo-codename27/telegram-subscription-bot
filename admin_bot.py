@@ -16,7 +16,7 @@ import threading
 import requests
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv('.env.admin')
 
 # ─────────────────────────────────────────────
 #  CONFIG
@@ -27,11 +27,15 @@ ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "0"))
 MAIN_BOT_API_URL = os.environ.get("MAIN_BOT_API_URL", "http://localhost:8080")
 SECRET_API_KEY = os.environ.get("SECRET_API_KEY", "")
 RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "")
-WEBHOOK_PORT = int(os.environ.get("ADMIN_PORT", 8081))
+# Railway injects $PORT for the public web server. Prefer it, then fall back
+# to ADMIN_PORT (explicit override) and finally 8081 for local development.
+WEBHOOK_PORT = int(os.environ.get("PORT") or os.environ.get("ADMIN_PORT", "8081"))
 
+# Tier names accepted when an admin approves a payment. Values are only used
+# for validation here; actual charge amounts live in bot.py (RAZORPAY_PRICES).
 TIER_PRICES = {
-    "bronze": 100,  # ₹1 for testing
-    "gold": 200,    # ₹2 for testing
+    "bronze": 100,
+    "gold": 200,
 }
 
 TIER_DURATION_DAYS = {
@@ -48,6 +52,9 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────
 #  DATABASE
 # ─────────────────────────────────────────────
+
+# NOTE: this is a transient queue of pending approvals and is intentionally
+# NOT persisted to a volume. It repopulates from incoming Razorpay webhooks.
 
 def init_db():
     con = sqlite3.connect("admin_payments.db")

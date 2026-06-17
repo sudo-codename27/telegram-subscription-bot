@@ -45,6 +45,13 @@ if not BOT_TOKEN:
 
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "0"))
 
+# Shared secret used to authenticate admin_bot.py -> bot.py API calls.
+SECRET_API_KEY = os.environ.get("SECRET_API_KEY", "")
+
+# Database path. Defaults to the local file for development; on Railway set
+# DB_PATH=/data/subscriptions.db so data lives on the attached volume.
+DB_PATH = os.environ.get("DB_PATH", "subscriptions.db")
+
 TIER_CHANNELS = {
     "bronze": -1004446165809,
     "gold":   -1004487193283,
@@ -74,8 +81,8 @@ RAZORPAY_GOLD_PAGE = os.environ.get("RAZORPAY_GOLD_PAGE", "")
 WEBHOOK_PORT = int(os.environ.get("PORT", 8080))
 
 RAZORPAY_PRICES = {
-    "bronze": 8000,
-    "gold": 20000,
+    "bronze": 24900,  # ₹249 for 2 months
+    "gold": 50900,    # ₹509 for 2 months
 }
 
 RAZORPAY_PAYMENT_PAGES = {
@@ -97,11 +104,52 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
+#  DATABASE
+# ─────────────────────────────────────────────
+
+def db_connect():
+    """Open a connection to the subscriptions database (honors DB_PATH)."""
+    return sqlite3.connect(DB_PATH)
+
+# ─────────────────────────────────────────────
 #  FLASK WEBHOOK SERVER
 # ─────────────────────────────────────────────
 
 webhook_app = Flask(__name__)
 bot_app = None
+
+
+def grant_subscription_sync(user_id: int, tier: str, payment_id: str, paid_amount_rupees: int, status: str):
+    """Grant a subscription and send the invite link, from a sync (Flask) context.
+
+    Shared by the Razorpay webhook and the /api/grant_subscription endpoint so
+    both paths behave identically. Returns a (body_dict, http_status) tuple.
+    """
+    if charge_id_already_used(payment_id):
+        logger.warning(f"Duplicate payment {payment_id}")
+        return {"status": "already_processed"}, 200
+
+    log_payment(user_id, tier, payment_id, paid_amount_rupees, status)
+
+    existing = get_active_subscription(user_id, tier)
+    if existing:
+        old_expiry = datetime.fromisoformat(existing[1])
+        base_date = max(old_expiry, datetime.now())
+    else:
+        base_date = datetime.now()
+
+    expiry = base_date + timedelta(days=TIER_DURATION_DAYS[tier])
+    save_subscription(user_id, tier, expiry, payment_id)
+
+    logger.info(f"✅ Subscription granted: user {user_id}, tier {tier}, payment {payment_id} ({status})")
+
+    if bot_app:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(send_invite_link(user_id, tier, expiry, payment_id))
+
+    return {"status": "success"}, 200
+
 
 def verify_razorpay_signature(payload, signature, secret):
     """Verify webhook authenticity using HMAC SHA256."""
@@ -157,30 +205,10 @@ def razorpay_webhook():
                 logger.error(f"Amount mismatch: expected {expected_amount}, got {amount}")
                 return jsonify({"error": "Amount mismatch"}), 400
             
-            if charge_id_already_used(payment_id):
-                logger.warning(f"Duplicate payment {payment_id}")
-                return jsonify({"status": "already_processed"}), 200
-            
-            log_payment(user_id, tier, payment_id, amount // 100, "razorpay_captured")
-            
-            existing = get_active_subscription(user_id, tier)
-            if existing:
-                old_expiry = datetime.fromisoformat(existing[1])
-                base_date = max(old_expiry, datetime.now())
-            else:
-                base_date = datetime.now()
-            
-            expiry = base_date + timedelta(days=TIER_DURATION_DAYS[tier])
-            save_subscription(user_id, tier, expiry, payment_id)
-            
-            logger.info(f"✅ Razorpay payment: user {user_id}, tier {tier}, payment {payment_id}")
-            
-            if bot_app:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                loop.run_until_complete(send_invite_link(user_id, tier, expiry, payment_id))
-            
-            return jsonify({"status": "success"}), 200
+            body, status_code = grant_subscription_sync(
+                user_id, tier, payment_id, amount // 100, "razorpay_captured"
+            )
+            return jsonify(body), status_code
         
         else:
             logger.info(f"Received Razorpay event: {event_type}")
@@ -188,6 +216,54 @@ def razorpay_webhook():
     
     except Exception as e:
         logger.error(f"Webhook error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+@webhook_app.route('/api/grant_subscription', methods=['POST'])
+def api_grant_subscription():
+    """Grant a subscription on behalf of the admin bot (manual approval flow).
+
+    admin_bot.py calls this after an admin approves a Razorpay payment and
+    replies with `<user_id> <tier>`. Authenticated via SECRET_API_KEY.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+
+        # 1. Authenticate.
+        provided_key = data.get("api_key", "")
+        if not SECRET_API_KEY or not hmac.compare_digest(str(provided_key), SECRET_API_KEY):
+            logger.warning("Unauthorized /api/grant_subscription request (bad or missing api_key)")
+            return jsonify({"error": "Unauthorized"}), 401
+
+        # 2. Validate input.
+        user_id = data.get("user_id")
+        tier = data.get("tier")
+        payment_id = data.get("payment_id")
+
+        if user_id is None or tier is None:
+            return jsonify({"error": "Missing user_id or tier"}), 400
+
+        try:
+            user_id = int(user_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "Invalid user_id"}), 400
+
+        tier = str(tier).lower()
+        if tier not in TIER_DURATION_DAYS:
+            return jsonify({"error": f"Invalid tier: {tier}"}), 400
+
+        if not payment_id:
+            # Synthesize a stable id so duplicate-detection still works.
+            payment_id = f"manual_{user_id}_{tier}_{int(time())}"
+
+        # 3-6. Grant + send invite link (shared logic).
+        paid_amount_rupees = RAZORPAY_PRICES.get(tier, 0) // 100
+        body, status_code = grant_subscription_sync(
+            user_id, tier, payment_id, paid_amount_rupees, "razorpay_admin_approved"
+        )
+        return jsonify(body), status_code
+
+    except Exception as e:
+        logger.error(f"/api/grant_subscription error: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 @webhook_app.route('/health', methods=['GET'])
@@ -203,16 +279,17 @@ def index():
         "service": "Desire Musing Bot Webhook Server",
         "endpoints": {
             "webhook": "/webhook/razorpay",
+            "grant_subscription": "/api/grant_subscription",
             "health": "/health"
         }
     }), 200
 
 # ─────────────────────────────────────────────
-#  DATABASE
+#  DATABASE FUNCTIONS
 # ─────────────────────────────────────────────
 
 def init_db():
-    con = sqlite3.connect("subscriptions.db")
+    con = db_connect()
     con.execute("""
         CREATE TABLE IF NOT EXISTS subscriptions (
             user_id     INTEGER,
@@ -247,7 +324,7 @@ def init_db():
 
 def get_active_subscription(user_id: int, tier: str):
     try:
-        con = sqlite3.connect("subscriptions.db")
+        con = db_connect()
         row = con.execute(
             """SELECT tier, expiry, started_at FROM subscriptions
                WHERE user_id = ? AND tier = ? AND expiry > ?""",
@@ -261,7 +338,7 @@ def get_active_subscription(user_id: int, tier: str):
 
 def get_all_active_subscriptions(user_id: int):
     try:
-        con = sqlite3.connect("subscriptions.db")
+        con = db_connect()
         rows = con.execute(
             """SELECT tier, expiry, started_at FROM subscriptions
                WHERE user_id = ? AND expiry > ?""",
@@ -275,7 +352,7 @@ def get_all_active_subscriptions(user_id: int):
 
 def save_subscription(user_id: int, tier: str, expiry: datetime, charge_id: str):
     try:
-        con = sqlite3.connect("subscriptions.db")
+        con = db_connect()
         con.execute(
             """INSERT OR REPLACE INTO subscriptions
                (user_id, tier, expiry, charge_id, started_at)
@@ -289,7 +366,7 @@ def save_subscription(user_id: int, tier: str, expiry: datetime, charge_id: str)
 
 def delete_subscription(user_id: int, tier: str):
     try:
-        con = sqlite3.connect("subscriptions.db")
+        con = db_connect()
         con.execute(
             "DELETE FROM subscriptions WHERE user_id = ? AND tier = ?",
             (user_id, tier),
@@ -301,7 +378,7 @@ def delete_subscription(user_id: int, tier: str):
 
 def get_expired_subscriptions():
     try:
-        con = sqlite3.connect("subscriptions.db")
+        con = db_connect()
         rows = con.execute(
             "SELECT user_id, tier FROM subscriptions WHERE expiry <= ?",
             (datetime.now().isoformat(),),
@@ -314,7 +391,7 @@ def get_expired_subscriptions():
 
 def charge_id_already_used(charge_id: str) -> bool:
     try:
-        con = sqlite3.connect("subscriptions.db")
+        con = db_connect()
         row = con.execute(
             "SELECT id FROM payments_log WHERE charge_id = ?", (charge_id,)
         ).fetchone()
@@ -326,7 +403,7 @@ def charge_id_already_used(charge_id: str) -> bool:
 
 def log_payment(user_id: int, tier: str, charge_id: str, stars: int, status: str):
     try:
-        con = sqlite3.connect("subscriptions.db")
+        con = db_connect()
         con.execute(
             """INSERT OR IGNORE INTO payments_log
                (user_id, tier, charge_id, stars, paid_at, status)
@@ -340,7 +417,7 @@ def log_payment(user_id: int, tier: str, charge_id: str, stars: int, status: str
 
 def is_blacklisted(user_id: int) -> bool:
     try:
-        con = sqlite3.connect("subscriptions.db")
+        con = db_connect()
         row = con.execute(
             "SELECT user_id FROM blacklist WHERE user_id = ?", (user_id,)
         ).fetchone()
@@ -352,7 +429,7 @@ def is_blacklisted(user_id: int) -> bool:
 
 def add_to_blacklist(user_id: int, reason: str, banned_by: int):
     try:
-        con = sqlite3.connect("subscriptions.db")
+        con = db_connect()
         con.execute(
             """INSERT OR REPLACE INTO blacklist (user_id, reason, banned_at, banned_by)
                VALUES (?, ?, ?, ?)""",
@@ -365,7 +442,7 @@ def add_to_blacklist(user_id: int, reason: str, banned_by: int):
 
 def remove_from_blacklist(user_id: int):
     try:
-        con = sqlite3.connect("subscriptions.db")
+        con = db_connect()
         con.execute("DELETE FROM blacklist WHERE user_id = ?", (user_id,))
         con.commit()
         con.close()
@@ -495,8 +572,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✨ *Welcome to Desire Musing!*\n\n"
         "Get exclusive access to premium content by choosing a plan below.\n"
         "Payment is made with Telegram Stars ⭐ or Razorpay 💳\n\n"
-        "🥉 *Bronze* — 100 ⭐ or ₹80 / 2 months\n"
-        "🥇 *Gold* — 250 ⭐ or ₹200 / 2 months\n\n"
+        "🥉 *Bronze* — 100 ⭐ or ₹249 / 2 months\n"
+        "🥇 *Gold* — 250 ⭐ or ₹509 / 2 months\n\n"
         "👇 Select your plan to get started:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard),
@@ -529,8 +606,8 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Settings → My Stars*\n\n"
         "Your balance is shown at the top of that screen.\n\n"
         "💡 *Our prices:*\n"
-        "🥉 Bronze — 100 ⭐ or ₹80 (2 months)\n"
-        "🥇 Gold   — 250 ⭐ or ₹200 (2 months)\n\n"
+        "🥉 Bronze — 100 ⭐ or ₹249 (2 months)\n"
+        "🥇 Gold   — 250 ⭐ or ₹509 (2 months)\n\n"
         "Use /start when you're ready!",
         parse_mode="Markdown",
     )
@@ -581,8 +658,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text(
             "✨ *Welcome to Desire Musing!*\n\n"
             "Get exclusive access to premium content by choosing a plan below.\n\n"
-            "🥉 *Bronze* — 100 ⭐ or ₹80 / 2 months\n"
-            "🥇 *Gold* — 250 ⭐ or ₹200 / 2 months\n\n"
+            "🥉 *Bronze* — 100 ⭐ or ₹249 / 2 months\n"
+            "🥇 *Gold* — 250 ⭐ or ₹509 / 2 months\n\n"
             "👇 Select your plan to get started:",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(keyboard),
@@ -1023,7 +1100,7 @@ def run_webhook_server():
     logger.info(f"Starting webhook server on port {WEBHOOK_PORT}...")
     webhook_app.run(host='0.0.0.0', port=WEBHOOK_PORT, debug=False, use_reloader=False)
 
-# ───���─────────────────────────────────────────
+# ─────────────────────────────────────────────
 #  MAIN
 # ─────────────────────────────────────────────
 
